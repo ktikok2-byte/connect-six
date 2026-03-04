@@ -1,0 +1,52 @@
+# Vercel Speed Insights Implementation
+
+Successfully implemented Vercel Speed Insights for the Connect Six game application.
+
+## Changes Made
+
+### 1. Installed Dependencies
+- Added `@vercel/speed-insights` package to the project
+- Package version installed: Latest version available via npm
+
+### 2. Modified Files
+
+**src/App.jsx**
+- Added import statement: `import { SpeedInsights } from '@vercel/speed-insights/react';`
+- Added `<SpeedInsights />` component at the end of the main App component's return statement
+- The component is placed just before the closing div tag to ensure it tracks all page interactions
+
+**package.json & package-lock.json**
+- Updated to include the new `@vercel/speed-insights` dependency
+
+## Implementation Details
+
+This is a React application built with Vite. Following the Vercel Speed Insights documentation for React applications, I implemented the Speed Insights tracking by:
+
+1. Using the React-specific package (`@vercel/speed-insights/react`)
+2. Adding the `<SpeedInsights />` component to the main App component
+3. Placing it at the root level to track all routes and interactions
+
+The component is a wrapper around the tracking script that provides seamless integration with React applications and will automatically:
+- Track Core Web Vitals (CWV) metrics
+- Monitor page performance
+- Send data to Vercel's Speed Insights dashboard once deployed
+
+## Testing & Verification
+
+✅ Build completed successfully (`npm run build`)
+✅ No new linting errors introduced by these changes
+✅ Application structure preserved
+✅ Lock files updated correctly
+
+## Next Steps
+
+After deployment to Vercel:
+1. Enable Speed Insights in the Vercel dashboard (Project → Speed Insights → Enable)
+2. The `/_vercel/speed-insights/script.js` route will be automatically added
+3. Performance metrics will start appearing in the Speed Insights dashboard after users visit the site
+
+## Notes
+
+- The implementation follows Vercel's recommended pattern for React applications
+- Pre-existing linting warnings in the codebase were not addressed as they are unrelated to this implementation
+- The SpeedInsights component requires no additional configuration for basic usage

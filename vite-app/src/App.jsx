@@ -202,7 +202,7 @@ const App = () => {
     setView('lobby');
   }, []);
 
-  const startMatchmaking = async () => {
+  const startMatchmaking = () => {
     setView('matchmaking');
     setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중... (허용 승률차: 0%)");
     setElapsedTime(0);
@@ -214,28 +214,10 @@ const App = () => {
       : 0;
     const myTotalGames = userData?.totalGames || 0;
 
-    // Use a simpler collection path for the matchmaking pool
     const poolCollectionPath = collection(db, 'artifacts', appId, 'matchmaking_pool');
     const poolRef = doc(poolCollectionPath, user.uid);
 
-    // Write to pool — MUST succeed for matchmaking to work
-    try {
-      await setDoc(poolRef, {
-        uid: user.uid,
-        username: userData?.username || 'Unknown',
-        winRate: myWinRate,
-        totalGames: myTotalGames,
-        timestamp: serverTimestamp(),
-        gameId: null
-      });
-    } catch (err) {
-      console.error('Matchmaking pool write failed:', err);
-      setMatchmakingStatus("매칭 서버 연결 실패. AI 대전으로 전환합니다...");
-      setTimeout(() => startComputerGame(), 1500);
-      return;
-    }
-
-    // Timer interval — simple, guaranteed, never async
+    // 1) Start timer FIRST — completely independent of Firebase
     const timerInterval = setInterval(() => {
       if (stopped) return;
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -244,18 +226,35 @@ const App = () => {
       setMatchmakingStatus(`숲 속에서 대전 상대를 찾는 중... (허용 승률차: ${tolerance}%)`);
     }, 1000);
 
-    // Use onSnapshot for real-time opponent detection (instead of polling)
-    const unsubscribePool = onSnapshot(poolCollectionPath, async (snapshot) => {
+    // 2) Timeout fallback → AI game after 30 seconds
+    const timeoutId = setTimeout(() => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timerInterval);
+      if (unsubPool) unsubPool();
+      matchmakingCleanup.current = null;
+      deleteDoc(poolRef).catch(() => {});
+      startComputerGame();
+    }, MATCH_TIMEOUT);
+
+    // Helper to stop everything
+    const stopAll = () => {
+      stopped = true;
+      clearInterval(timerInterval);
+      clearTimeout(timeoutId);
+      if (unsubPool) unsubPool();
+      matchmakingCleanup.current = null;
+    };
+
+    // 3) Listen to pool in real-time for opponent detection
+    let unsubPool = null;
+    unsubPool = onSnapshot(poolCollectionPath, (snapshot) => {
       if (stopped) return;
 
       // Check if we've been matched by someone else
       const myDoc = snapshot.docs.find(d => d.id === user.uid);
       if (myDoc && myDoc.data().gameId) {
-        stopped = true;
-        clearInterval(timerInterval);
-        clearTimeout(timeoutId);
-        unsubscribePool();
-        matchmakingCleanup.current = null;
+        stopAll();
         const gameId = myDoc.data().gameId;
         deleteDoc(poolRef).catch(() => {});
         joinPvPGame(gameId);
@@ -287,26 +286,21 @@ const App = () => {
 
         // Only the player with the smaller UID creates the game (avoid duplicates)
         if (user.uid < opponent.id) {
-          stopped = true;
-          clearInterval(timerInterval);
-          clearTimeout(timeoutId);
-          unsubscribePool();
-          matchmakingCleanup.current = null;
-          try {
-            const gameId = await createPvPGame(opponent.data());
-            // Tag both pool entries so the opponent also joins
-            await updateDoc(poolRef, { gameId }).catch(() => {});
-            await updateDoc(
-              doc(poolCollectionPath, opponent.id),
-              { gameId }
-            ).catch(() => {});
-            deleteDoc(poolRef).catch(() => {});
-            joinPvPGame(gameId);
-          } catch (err) {
+          stopAll();
+          createPvPGame(opponent.data()).then((gameId) => {
+            // Tag both pool entries so the opponent joins too
+            Promise.all([
+              updateDoc(poolRef, { gameId }).catch(() => {}),
+              updateDoc(doc(poolCollectionPath, opponent.id), { gameId }).catch(() => {})
+            ]).then(() => {
+              deleteDoc(poolRef).catch(() => {});
+              joinPvPGame(gameId);
+            });
+          }).catch((err) => {
             console.error('Failed to create PvP game:', err);
             deleteDoc(poolRef).catch(() => {});
             startComputerGame();
-          }
+          });
         } else {
           setMatchmakingStatus("상대를 발견! 연결 중...");
         }
@@ -315,23 +309,24 @@ const App = () => {
       console.warn('Pool snapshot error:', err);
     });
 
-    // Timeout fallback → AI game after 30 seconds
-    const timeoutId = setTimeout(() => {
-      if (stopped) return;
-      stopped = true;
-      clearInterval(timerInterval);
-      unsubscribePool();
-      matchmakingCleanup.current = null;
-      deleteDoc(poolRef).catch(() => {});
-      startComputerGame();
-    }, MATCH_TIMEOUT);
+    // 4) Write to pool LAST (non-blocking) — triggers onSnapshot for both players
+    setDoc(poolRef, {
+      uid: user.uid,
+      username: userData?.username || 'Unknown',
+      winRate: myWinRate,
+      totalGames: myTotalGames,
+      timestamp: serverTimestamp(),
+      gameId: null
+    }).catch((err) => {
+      console.error('Matchmaking pool write failed:', err);
+      stopAll();
+      setMatchmakingStatus("매칭 서버 연결 실패. AI 대전으로 전환합니다...");
+      setTimeout(() => startComputerGame(), 1500);
+    });
 
-    // Store cleanup so cancel button can use it
+    // 5) Store cleanup for cancel button
     matchmakingCleanup.current = () => {
-      stopped = true;
-      clearInterval(timerInterval);
-      clearTimeout(timeoutId);
-      unsubscribePool();
+      stopAll();
       deleteDoc(poolRef).catch(() => {});
     };
   };

@@ -202,6 +202,61 @@ const App = () => {
     setView('lobby');
   }, []);
 
+  // Calculate tolerance from elapsed seconds: +10% every 2 seconds, max 100%
+  const calcTolerance = (elapsedSec) => Math.min(Math.floor(elapsedSec / 2) * 10, 100);
+
+  // Core matching logic — shared by both onSnapshot and polling fallback
+  const tryMatchOpponents = (docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll) => {
+    const now = Date.now();
+    const myElapsed = Math.floor((now - startTime) / 1000);
+    const myTolerance = calcTolerance(myElapsed);
+
+    const allOpponents = docs.filter(d => d.id !== user.uid && !d.data().gameId);
+
+    // Filter: match if EITHER player's tolerance covers the win-rate difference
+    const winRateDiff = (oppData) => Math.abs((oppData.winRate || 0) - myWinRate);
+    const matchable = allOpponents.filter(d => {
+      const diff = winRateDiff(d.data());
+      const oppElapsed = d.data().enteredAt ? Math.floor((now - d.data().enteredAt) / 1000) : 0;
+      const oppTolerance = calcTolerance(oppElapsed);
+      // Match if EITHER player's tolerance is wide enough
+      return diff <= Math.max(myTolerance, oppTolerance);
+    });
+
+    if (matchable.length === 0) return false;
+
+    // Tiered search: sort by closest totalGames count
+    matchable.sort((a, b) => {
+      const aDiff = Math.abs((a.data().totalGames || 0) - myTotalGames);
+      const bDiff = Math.abs((b.data().totalGames || 0) - myTotalGames);
+      return aDiff - bDiff;
+    });
+
+    const opponent = matchable[0];
+
+    // Only the player with the smaller UID creates the game (avoid duplicates)
+    if (user.uid < opponent.id) {
+      stopAll();
+      createPvPGame(opponent.data()).then((gameId) => {
+        Promise.all([
+          updateDoc(poolRef, { gameId }).catch(() => {}),
+          updateDoc(doc(poolCollectionPath, opponent.id), { gameId }).catch(() => {})
+        ]).then(() => {
+          deleteDoc(poolRef).catch(() => {});
+          joinPvPGame(gameId);
+        });
+      }).catch((err) => {
+        console.error('Failed to create PvP game:', err);
+        deleteDoc(poolRef).catch(() => {});
+        startComputerGame();
+      });
+      return true;
+    } else {
+      setMatchmakingStatus("상대를 발견! 연결 중...");
+      return false;
+    }
+  };
+
   const startMatchmaking = () => {
     setView('matchmaking');
     setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중... (허용 승률차: 0%)");
@@ -222,99 +277,79 @@ const App = () => {
       if (stopped) return;
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       setElapsedTime(elapsed);
-      const tolerance = Math.min(Math.floor(elapsed / 2) * 10, 100);
+      const tolerance = calcTolerance(elapsed);
       setMatchmakingStatus(`숲 속에서 대전 상대를 찾는 중... (허용 승률차: ${tolerance}%)`);
     }, 1000);
 
     // 2) Timeout fallback → AI game after 30 seconds
     const timeoutId = setTimeout(() => {
       if (stopped) return;
-      stopped = true;
-      clearInterval(timerInterval);
-      if (unsubPool) unsubPool();
-      matchmakingCleanup.current = null;
+      stopAll();
       deleteDoc(poolRef).catch(() => {});
       startComputerGame();
     }, MATCH_TIMEOUT);
 
     // Helper to stop everything
+    let unsubPool = null;
+    let pollInterval = null;
     const stopAll = () => {
       stopped = true;
       clearInterval(timerInterval);
+      clearInterval(pollInterval);
       clearTimeout(timeoutId);
       if (unsubPool) unsubPool();
       matchmakingCleanup.current = null;
     };
 
-    // 3) Listen to pool in real-time for opponent detection
-    let unsubPool = null;
+    // 3) Try onSnapshot for real-time detection
+    let snapshotWorking = false;
     unsubPool = onSnapshot(poolCollectionPath, (snapshot) => {
       if (stopped) return;
+      snapshotWorking = true;
 
       // Check if we've been matched by someone else
       const myDoc = snapshot.docs.find(d => d.id === user.uid);
       if (myDoc && myDoc.data().gameId) {
         stopAll();
-        const gameId = myDoc.data().gameId;
         deleteDoc(poolRef).catch(() => {});
-        joinPvPGame(gameId);
+        joinPvPGame(myDoc.data().gameId);
         return;
       }
 
-      // Find opponents not yet matched
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      const tolerance = Math.min(Math.floor(elapsed / 2) * 10, 100);
-
-      const allOpponents = snapshot.docs
-        .filter(d => d.id !== user.uid && !d.data().gameId);
-
-      // Filter by win-rate tolerance
-      const matchable = allOpponents.filter(d => {
-        const oppWinRate = d.data().winRate || 0;
-        return Math.abs(oppWinRate - myWinRate) <= tolerance;
-      });
-
-      if (matchable.length > 0) {
-        // Tiered search: sort by closest totalGames count
-        matchable.sort((a, b) => {
-          const aDiff = Math.abs((a.data().totalGames || 0) - myTotalGames);
-          const bDiff = Math.abs((b.data().totalGames || 0) - myTotalGames);
-          return aDiff - bDiff;
-        });
-
-        const opponent = matchable[0];
-
-        // Only the player with the smaller UID creates the game (avoid duplicates)
-        if (user.uid < opponent.id) {
-          stopAll();
-          createPvPGame(opponent.data()).then((gameId) => {
-            // Tag both pool entries so the opponent joins too
-            Promise.all([
-              updateDoc(poolRef, { gameId }).catch(() => {}),
-              updateDoc(doc(poolCollectionPath, opponent.id), { gameId }).catch(() => {})
-            ]).then(() => {
-              deleteDoc(poolRef).catch(() => {});
-              joinPvPGame(gameId);
-            });
-          }).catch((err) => {
-            console.error('Failed to create PvP game:', err);
-            deleteDoc(poolRef).catch(() => {});
-            startComputerGame();
-          });
-        } else {
-          setMatchmakingStatus("상대를 발견! 연결 중...");
-        }
-      }
+      tryMatchOpponents(snapshot.docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll);
     }, (err) => {
-      console.warn('Pool snapshot error:', err);
+      console.warn('Pool onSnapshot failed, using polling fallback:', err);
     });
 
-    // 4) Write to pool LAST (non-blocking) — triggers onSnapshot for both players
+    // 4) Polling fallback — in case onSnapshot fails (e.g. security rules)
+    pollInterval = setInterval(async () => {
+      if (stopped || snapshotWorking) return;
+      try {
+        const snapshot = await getDocs(poolCollectionPath);
+        if (stopped) return;
+
+        // Check if we've been matched
+        const myDoc = snapshot.docs.find(d => d.id === user.uid);
+        if (myDoc && myDoc.data().gameId) {
+          stopAll();
+          deleteDoc(poolRef).catch(() => {});
+          joinPvPGame(myDoc.data().gameId);
+          return;
+        }
+
+        tryMatchOpponents(snapshot.docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll);
+      } catch (err) {
+        console.warn('Matchmaking poll error:', err);
+      }
+    }, 2500);
+
+    // 5) Write to pool LAST (non-blocking)
     setDoc(poolRef, {
       uid: user.uid,
       username: userData?.username || 'Unknown',
       winRate: myWinRate,
       totalGames: myTotalGames,
+      enteredAt: Date.now(),
       timestamp: serverTimestamp(),
       gameId: null
     }).catch((err) => {
@@ -324,7 +359,7 @@ const App = () => {
       setTimeout(() => startComputerGame(), 1500);
     });
 
-    // 5) Store cleanup for cancel button
+    // 6) Store cleanup for cancel button
     matchmakingCleanup.current = () => {
       stopAll();
       deleteDoc(poolRef).catch(() => {});

@@ -202,112 +202,137 @@ const App = () => {
     setView('lobby');
   }, []);
 
-  const startMatchmaking = () => {
+  const startMatchmaking = async () => {
     setView('matchmaking');
-    setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중...");
+    setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중... (허용 승률차: 0%)");
     setElapsedTime(0);
     const startTime = Date.now();
     let stopped = false;
-    let poolRef;
 
+    const myWinRate = userData?.totalGames > 0
+      ? (userData.wins / userData.totalGames) * 100
+      : 0;
+    const myTotalGames = userData?.totalGames || 0;
+
+    // Use a simpler collection path for the matchmaking pool
+    const poolCollectionPath = collection(db, 'artifacts', appId, 'matchmaking_pool');
+    const poolRef = doc(poolCollectionPath, user.uid);
+
+    // Write to pool — MUST succeed for matchmaking to work
     try {
-      poolRef = doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', user.uid);
-    } catch (e) {
-      console.error('Failed to create pool ref:', e);
-      startComputerGame();
+      await setDoc(poolRef, {
+        uid: user.uid,
+        username: userData?.username || 'Unknown',
+        winRate: myWinRate,
+        totalGames: myTotalGames,
+        timestamp: serverTimestamp(),
+        gameId: null
+      });
+    } catch (err) {
+      console.error('Matchmaking pool write failed:', err);
+      setMatchmakingStatus("매칭 서버 연결 실패. AI 대전으로 전환합니다...");
+      setTimeout(() => startComputerGame(), 1500);
       return;
     }
 
-    // Write to matchmaking pool (fire-and-forget)
-    setDoc(poolRef, {
-      uid: user.uid,
-      username: userData?.username || 'Unknown',
-      timestamp: serverTimestamp(),
-      gameId: null
-    }).catch((err) => console.warn('Matchmaking pool write failed:', err));
-
-    // Timer interval — simple, guaranteed to work, never async
+    // Timer interval — simple, guaranteed, never async
     const timerInterval = setInterval(() => {
       if (stopped) return;
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       setElapsedTime(elapsed);
+      const tolerance = Math.min(Math.floor(elapsed / 2) * 10, 100);
+      setMatchmakingStatus(`숲 속에서 대전 상대를 찾는 중... (허용 승률차: ${tolerance}%)`);
     }, 1000);
 
-    // Separate polling interval for matchmaking — async Firebase operations
-    let polling = false;
-    const pollInterval = setInterval(async () => {
-      if (stopped || polling) return;
-      polling = true;
+    // Use onSnapshot for real-time opponent detection (instead of polling)
+    const unsubscribePool = onSnapshot(poolCollectionPath, async (snapshot) => {
+      if (stopped) return;
 
-      try {
-        // Check if someone else already matched us
-        const myEntry = await getDoc(poolRef);
-        if (stopped) { polling = false; return; }
-        if (myEntry.exists() && myEntry.data().gameId) {
+      // Check if we've been matched by someone else
+      const myDoc = snapshot.docs.find(d => d.id === user.uid);
+      if (myDoc && myDoc.data().gameId) {
+        stopped = true;
+        clearInterval(timerInterval);
+        clearTimeout(timeoutId);
+        unsubscribePool();
+        matchmakingCleanup.current = null;
+        const gameId = myDoc.data().gameId;
+        deleteDoc(poolRef).catch(() => {});
+        joinPvPGame(gameId);
+        return;
+      }
+
+      // Find opponents not yet matched
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const tolerance = Math.min(Math.floor(elapsed / 2) * 10, 100);
+
+      const allOpponents = snapshot.docs
+        .filter(d => d.id !== user.uid && !d.data().gameId);
+
+      // Filter by win-rate tolerance
+      const matchable = allOpponents.filter(d => {
+        const oppWinRate = d.data().winRate || 0;
+        return Math.abs(oppWinRate - myWinRate) <= tolerance;
+      });
+
+      if (matchable.length > 0) {
+        // Tiered search: sort by closest totalGames count
+        matchable.sort((a, b) => {
+          const aDiff = Math.abs((a.data().totalGames || 0) - myTotalGames);
+          const bDiff = Math.abs((b.data().totalGames || 0) - myTotalGames);
+          return aDiff - bDiff;
+        });
+
+        const opponent = matchable[0];
+
+        // Only the player with the smaller UID creates the game (avoid duplicates)
+        if (user.uid < opponent.id) {
           stopped = true;
           clearInterval(timerInterval);
-          clearInterval(pollInterval);
+          clearTimeout(timeoutId);
+          unsubscribePool();
           matchmakingCleanup.current = null;
-          const gameId = myEntry.data().gameId;
-          deleteDoc(poolRef).catch(() => {});
-          joinPvPGame(gameId);
-          polling = false;
-          return;
-        }
-
-        // Look for other players waiting
-        const poolSnapshot = await getDocs(
-          collection(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool')
-        );
-        if (stopped) { polling = false; return; }
-
-        const opponents = poolSnapshot.docs.filter(d => d.id !== user.uid && !d.data().gameId);
-        if (opponents.length > 0) {
-          const opponent = opponents[0];
-          // Only the player with the smaller UID creates the game to avoid duplicates
-          if (user.uid < opponent.id) {
-            stopped = true;
-            clearInterval(timerInterval);
-            clearInterval(pollInterval);
-            matchmakingCleanup.current = null;
+          try {
             const gameId = await createPvPGame(opponent.data());
             // Tag both pool entries so the opponent also joins
             await updateDoc(poolRef, { gameId }).catch(() => {});
             await updateDoc(
-              doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', opponent.id),
+              doc(poolCollectionPath, opponent.id),
               { gameId }
             ).catch(() => {});
             deleteDoc(poolRef).catch(() => {});
             joinPvPGame(gameId);
-            polling = false;
-            return;
+          } catch (err) {
+            console.error('Failed to create PvP game:', err);
+            deleteDoc(poolRef).catch(() => {});
+            startComputerGame();
           }
-          // If our uid is larger, wait for the other player to create the game
+        } else {
           setMatchmakingStatus("상대를 발견! 연결 중...");
         }
-
-        // Timeout → fall back to AI game
-        if ((Date.now() - startTime) > MATCH_TIMEOUT) {
-          stopped = true;
-          clearInterval(timerInterval);
-          clearInterval(pollInterval);
-          matchmakingCleanup.current = null;
-          deleteDoc(poolRef).catch(() => {});
-          startComputerGame();
-        }
-      } catch (err) {
-        console.warn('Matchmaking poll error:', err);
-      } finally {
-        polling = false;
       }
-    }, 2000);
+    }, (err) => {
+      console.warn('Pool snapshot error:', err);
+    });
 
-    // Store cleanup so cancel button and navigation can use it
+    // Timeout fallback → AI game after 30 seconds
+    const timeoutId = setTimeout(() => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timerInterval);
+      unsubscribePool();
+      matchmakingCleanup.current = null;
+      deleteDoc(poolRef).catch(() => {});
+      startComputerGame();
+    }, MATCH_TIMEOUT);
+
+    // Store cleanup so cancel button can use it
     matchmakingCleanup.current = () => {
       stopped = true;
       clearInterval(timerInterval);
-      clearInterval(pollInterval);
-      if (poolRef) deleteDoc(poolRef).catch(() => {});
+      clearTimeout(timeoutId);
+      unsubscribePool();
+      deleteDoc(poolRef).catch(() => {});
     };
   };
 
@@ -771,11 +796,16 @@ const App = () => {
                </div>
              </div>
              <h2 className="text-3xl font-bold text-gray-800 tracking-tight mb-4">대전 상대 탐색 중...</h2>
-             <p className="text-gray-500 font-medium text-sm mb-10">{matchmakingStatus}</p>
+             <p className="text-gray-500 font-medium text-sm mb-6">{matchmakingStatus}</p>
 
-             <div className="inline-flex items-center gap-3 bg-white px-6 py-3 rounded-full border border-emerald-100 text-gray-700 font-medium shadow-sm mb-12">
-               <Clock size={18} className="text-emerald-500" />
-               <span>{elapsedTime}초 경과</span>
+             <div className="flex items-center justify-center gap-4 mb-10">
+               <div className="inline-flex items-center gap-3 bg-white px-6 py-3 rounded-full border border-emerald-100 text-gray-700 font-medium shadow-sm">
+                 <Clock size={18} className="text-emerald-500" />
+                 <span>{elapsedTime}초 경과</span>
+               </div>
+               <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-3 rounded-full border border-emerald-100 text-emerald-700 font-medium shadow-sm text-sm">
+                 <span>허용 범위: {Math.min(Math.floor(elapsedTime / 2) * 10, 100)}%</span>
+               </div>
              </div>
 
              <div>

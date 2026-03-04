@@ -20,9 +20,10 @@ import {
   query,
   orderBy,
   limit as firestoreLimit,
-  serverTimestamp
+  serverTimestamp,
+  runTransaction
 } from 'firebase/firestore';
-import { Trophy, Play, Cpu, Shield, LogOut, RefreshCw, TreePine, Clock, UserPlus, Copy, Check } from 'lucide-react';
+import { Trophy, Play, Cpu, Shield, LogOut, RefreshCw, TreePine, Clock, UserPlus, Copy, Check, XCircle, Timer } from 'lucide-react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
 
 // --- Firebase Configuration from Environment Variables ---
@@ -43,6 +44,7 @@ const appId = import.meta.env.VITE_APP_ID || 'connect6-forest-v4';
 
 const BOARD_SIZE = 19;
 const MATCH_TIMEOUT = 30000;
+const TURN_TIME_LIMIT = 30; // seconds per turn
 
 const App = () => {
   const [user, setUser] = useState(null);
@@ -61,6 +63,7 @@ const App = () => {
   const [gameMode, setGameMode] = useState(null); // 'ai' | 'pvp'
   const [playerNumber, setPlayerNumber] = useState(0); // 1 or 2
   const matchmakingCleanup = useRef(null);
+  const gameResultHandled = useRef(false); // prevent double stats update
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
@@ -108,6 +111,49 @@ const App = () => {
       setLeaderboard(rankings);
     } catch (err) {
       console.error('Leaderboard fetch failed:', err);
+    }
+  };
+
+  const updatePlayerStats = async (winnerUid, loserUid) => {
+    if (gameResultHandled.current) return;
+    gameResultHandled.current = true;
+    try {
+      // Use transaction to atomically update winner stats
+      const winnerProfileRef = doc(db, 'artifacts', appId, 'users', winnerUid, 'profile', 'data');
+      const winnerLeaderRef = doc(db, 'artifacts', appId, 'leaderboard', winnerUid);
+      const loserProfileRef = doc(db, 'artifacts', appId, 'users', loserUid, 'profile', 'data');
+      const loserLeaderRef = doc(db, 'artifacts', appId, 'leaderboard', loserUid);
+
+      await runTransaction(db, async (transaction) => {
+        const winnerSnap = await transaction.get(winnerProfileRef);
+        const loserSnap = await transaction.get(loserProfileRef);
+        const wData = winnerSnap.exists() ? winnerSnap.data() : { wins: 0, losses: 0, totalGames: 0 };
+        const lData = loserSnap.exists() ? loserSnap.data() : { wins: 0, losses: 0, totalGames: 0 };
+
+        const wWins = (wData.wins || 0) + 1;
+        const wTotal = (wData.totalGames || 0) + 1;
+        const wRate = Math.round((wWins / wTotal) * 100);
+
+        const lLosses = (lData.losses || 0) + 1;
+        const lTotal = (lData.totalGames || 0) + 1;
+        const lWins = lData.wins || 0;
+        const lRate = lTotal > 0 ? Math.round((lWins / lTotal) * 100) : 0;
+
+        const winnerUpdate = { wins: wWins, totalGames: wTotal, winRate: wRate };
+        const loserUpdate = { losses: lLosses, totalGames: lTotal, winRate: lRate };
+
+        transaction.update(winnerProfileRef, winnerUpdate);
+        transaction.update(winnerLeaderRef, winnerUpdate);
+        transaction.update(loserProfileRef, loserUpdate);
+        transaction.update(loserLeaderRef, loserUpdate);
+      });
+
+      // Refresh local userData if current user was involved
+      if (user?.uid === winnerUid || user?.uid === loserUid) {
+        fetchUserData(user.uid);
+      }
+    } catch (err) {
+      console.error('Stats update failed:', err);
     }
   };
 
@@ -377,12 +423,16 @@ const App = () => {
       turnMoves: 0,
       status: 'active',
       winner: null,
+      loser: null,
+      winReason: null, // 'connect6' | 'timeout'
+      lastMoveAt: Date.now(),
       createdAt: serverTimestamp()
     });
     return gameRef.id;
   };
 
   const joinPvPGame = (gameId) => {
+    gameResultHandled.current = false;
     setGameMode('pvp');
     setCurrentGame({ id: gameId, mode: 'pvp' });
     setWinnerModal(null);
@@ -412,7 +462,36 @@ const App = () => {
     const [myPlayerNum, setMyPlayerNum] = useState(0);
     const [opponentName, setOpponentName] = useState('');
     const [isMyTurn, setIsMyTurn] = useState(false);
+    const [turnTimeLeft, setTurnTimeLeft] = useState(TURN_TIME_LIMIT);
+    const [gameFinished, setGameFinished] = useState(false);
     const moveCountRef = useRef(game.moveCount || 0);
+    const lastMoveAtRef = useRef(Date.now());
+    const turnTimerRef = useRef(null);
+    const timeoutClaimRef = useRef(false);
+
+    // PvP turn timer countdown
+    useEffect(() => {
+      if (game.mode !== 'pvp' || gameFinished) return;
+      turnTimerRef.current = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - lastMoveAtRef.current) / 1000);
+        const remaining = Math.max(0, TURN_TIME_LIMIT - elapsed);
+        setTurnTimeLeft(remaining);
+
+        // If it's our turn and time ran out, we lose via timeout
+        if (remaining === 0 && isMyTurn && !timeoutClaimRef.current && !gameFinished) {
+          timeoutClaimRef.current = true;
+          clearInterval(turnTimerRef.current);
+          const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
+          updateDoc(gameRef, {
+            status: 'finished',
+            winner: myPlayerNum === 1 ? 'player2' : 'player1',
+            loser: user.uid,
+            winReason: 'timeout'
+          }).catch(err => console.error('Timeout update failed:', err));
+        }
+      }, 200);
+      return () => clearInterval(turnTimerRef.current);
+    }, [game.mode, game.id, isMyTurn, myPlayerNum, gameFinished]);
 
     // PvP: subscribe to game doc for real-time sync
     useEffect(() => {
@@ -427,13 +506,49 @@ const App = () => {
         setMoveCount(data.moveCount);
         moveCountRef.current = data.moveCount;
 
+        // Reset turn timer when lastMoveAt changes
+        if (data.lastMoveAt) {
+          lastMoveAtRef.current = data.lastMoveAt;
+          setTurnTimeLeft(TURN_TIME_LIMIT);
+          timeoutClaimRef.current = false;
+        }
+
         const pNum = data.player1.uid === user.uid ? 1 : 2;
         setMyPlayerNum(pNum);
-        setIsMyTurn(data.turn === pNum);
+        setIsMyTurn(data.turn === pNum && data.status === 'active');
         setOpponentName(pNum === 1 ? data.player2.username : data.player1.username);
 
-        if (data.status === 'finished' && data.winner) {
-          setWinnerModal(data.winner === user.uid ? "나의 승리!" : `${pNum === 1 ? data.player2.username : data.player1.username} 승리`);
+        if (data.status === 'finished') {
+          setGameFinished(true);
+          clearInterval(turnTimerRef.current);
+
+          // Determine winner/loser UIDs
+          let winnerUid, loserUid, winnerName;
+          if (data.winReason === 'timeout') {
+            // timeout: winner field is 'player1' or 'player2' reference
+            winnerUid = data.winner === 'player1' ? data.player1.uid : data.player2.uid;
+            loserUid = data.loser;
+            winnerName = data.winner === 'player1' ? data.player1.username : data.player2.username;
+          } else {
+            // connect6 win: winner field is the UID directly
+            winnerUid = data.winner;
+            loserUid = winnerUid === data.player1.uid ? data.player2.uid : data.player1.uid;
+            winnerName = winnerUid === data.player1.uid ? data.player1.username : data.player2.username;
+          }
+
+          const iWon = winnerUid === user.uid;
+          const reasonText = data.winReason === 'timeout' ? ' (시간 초과)' : '';
+
+          if (iWon) {
+            setWinnerModal({ text: '나의 승리!' + reasonText, isWinner: true });
+          } else {
+            setWinnerModal({ text: `${winnerName} 승리${reasonText}`, isWinner: false });
+          }
+
+          // Only the winner updates stats (prevents double-counting)
+          if (iWon && winnerUid && loserUid) {
+            updatePlayerStats(winnerUid, loserUid);
+          }
         }
       });
       return () => unsubscribe();
@@ -461,10 +576,9 @@ const App = () => {
     };
 
     const handleCellClick = async (idx) => {
-      if (board[idx] !== 0 || winnerModal) return;
+      if (board[idx] !== 0 || winnerModal || gameFinished) return;
 
       if (game.mode === 'pvp') {
-        // PvP: only allow moves on our turn
         if (!isMyTurn) return;
 
         const newBoard = [...board];
@@ -474,7 +588,8 @@ const App = () => {
         let nextTurn = turn;
         let nextTurnMoves = turnMoves + 1;
         const nextMoveCount = moveCountRef.current + 1;
-        if (!won && (moveCountRef.current === 0 || nextTurnMoves === 2)) {
+        const turnSwitching = !won && (moveCountRef.current === 0 || nextTurnMoves === 2);
+        if (turnSwitching) {
           nextTurn = turn === 1 ? 2 : 1;
           nextTurnMoves = 0;
         }
@@ -483,9 +598,15 @@ const App = () => {
         await updateDoc(gameRef, {
           board: newBoard,
           turn: won ? turn : nextTurn,
-          turnMoves: won ? nextTurnMoves : nextTurnMoves,
+          turnMoves: nextTurnMoves,
           moveCount: nextMoveCount,
-          ...(won ? { status: 'finished', winner: user.uid } : {})
+          // Reset timer on turn switch or game end
+          ...(turnSwitching || won ? { lastMoveAt: Date.now() } : {}),
+          ...(won ? {
+            status: 'finished',
+            winner: user.uid,
+            winReason: 'connect6'
+          } : {})
         });
         return;
       }
@@ -496,7 +617,7 @@ const App = () => {
 
       if (checkWin(idx, turn, newBoard)) {
         setBoard(newBoard);
-        setWinnerModal(turn === 1 ? "흑돌(Black)" : "백돌(White)");
+        setWinnerModal({ text: turn === 1 ? "흑돌 승리!" : "백돌 승리!", isWinner: turn === 1 });
         return;
       }
 
@@ -528,7 +649,7 @@ const App = () => {
 
       if (checkWin(aiIdx, aiPlayer, newBoard)) {
         setBoard(newBoard);
-        setWinnerModal("컴퓨터(AI)");
+        setWinnerModal({ text: "컴퓨터(AI) 승리", isWinner: false });
         return;
       }
 
@@ -549,9 +670,13 @@ const App = () => {
     const BOARD_PX = 600;
     const CELL_SIZE = BOARD_PX / (BOARD_SIZE - 1);
 
+    const timerPercent = (turnTimeLeft / TURN_TIME_LIMIT) * 100;
+    const timerColor = turnTimeLeft <= 5 ? 'bg-red-500' : turnTimeLeft <= 10 ? 'bg-yellow-500' : 'bg-emerald-500';
+    const timerTextColor = turnTimeLeft <= 5 ? 'text-red-600' : turnTimeLeft <= 10 ? 'text-yellow-600' : 'text-emerald-600';
+
     return (
       <div className="flex flex-col items-center">
-        <div className="mb-8 flex items-center gap-6 bg-white/70 backdrop-blur-md px-10 py-4 rounded-3xl border border-emerald-100 shadow-sm">
+        <div className="mb-4 flex items-center gap-6 bg-white/70 backdrop-blur-md px-10 py-4 rounded-3xl border border-emerald-100 shadow-sm">
            <div className={`w-8 h-8 rounded-full shadow-md transition-all duration-500 transform ${turn === 1 ? 'bg-gray-800 scale-110' : 'bg-white scale-110 border border-gray-200'}`}></div>
            <div className="flex flex-col">
              <span className="text-gray-800 font-bold text-sm">
@@ -572,15 +697,33 @@ const App = () => {
              </div>
            </div>
            {game.mode === 'pvp' && (
-             <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
-               <div className={`w-3 h-3 rounded-full ${myPlayerNum === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-               <span>나</span>
-               <span className="text-gray-300">vs</span>
-               <div className={`w-3 h-3 rounded-full ${myPlayerNum === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-               <span>{opponentName}</span>
-             </div>
+             <>
+               <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
+                 <div className={`w-3 h-3 rounded-full ${myPlayerNum === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+                 <span>나</span>
+                 <span className="text-gray-300">vs</span>
+                 <div className={`w-3 h-3 rounded-full ${myPlayerNum === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+                 <span>{opponentName}</span>
+               </div>
+               <div className="ml-4 flex items-center gap-2">
+                 <Timer size={16} className={timerTextColor} />
+                 <span className={`font-bold text-lg tabular-nums ${timerTextColor} ${turnTimeLeft <= 5 ? 'animate-pulse' : ''}`}>
+                   {turnTimeLeft}s
+                 </span>
+               </div>
+             </>
            )}
         </div>
+
+        {/* Turn timer bar for PvP */}
+        {game.mode === 'pvp' && !gameFinished && (
+          <div className="w-full max-w-[660px] mb-4 h-2 bg-gray-200 rounded-full overflow-hidden">
+            <div
+              className={`h-full ${timerColor} rounded-full transition-all duration-200 ease-linear`}
+              style={{ width: `${timerPercent}%` }}
+            />
+          </div>
+        )}
 
         <div className="relative group mt-2">
           <div className="absolute inset-0 bg-emerald-900/5 blur-2xl rounded-lg translate-y-6 scale-95 pointer-events-none"></div>
@@ -868,26 +1011,50 @@ const App = () => {
         </div>
       )}
 
-      {winnerModal && (
-        <div className="fixed inset-0 z-[100] bg-white/60 backdrop-blur-md flex items-center justify-center p-6">
-          <div className="bg-white border border-emerald-100 p-16 rounded-[4rem] shadow-2xl text-center max-w-lg w-full relative overflow-hidden">
-            <div className="mb-8 inline-flex p-8 bg-yellow-50 rounded-full text-yellow-500 shadow-sm border border-yellow-100">
-              <Trophy size={80} strokeWidth={1.5} />
+      {winnerModal && (() => {
+        const isWin = typeof winnerModal === 'object' ? winnerModal.isWinner : true;
+        const modalText = typeof winnerModal === 'object' ? winnerModal.text : winnerModal;
+        return (
+          <div className={`fixed inset-0 z-[100] backdrop-blur-md flex items-center justify-center p-6 ${isWin ? 'bg-white/60' : 'bg-gray-900/40'}`}>
+            <div className={`p-16 rounded-[4rem] shadow-2xl text-center max-w-lg w-full relative overflow-hidden ${
+              isWin
+                ? 'bg-white border border-emerald-100'
+                : 'bg-gray-50 border border-red-200'
+            }`}>
+              {isWin ? (
+                <div className="mb-8 inline-flex p-8 bg-yellow-50 rounded-full text-yellow-500 shadow-sm border border-yellow-100">
+                  <Trophy size={80} strokeWidth={1.5} />
+                </div>
+              ) : (
+                <div className="mb-8 inline-flex p-8 bg-red-50 rounded-full text-red-400 shadow-sm border border-red-100">
+                  <XCircle size={80} strokeWidth={1.5} />
+                </div>
+              )}
+              <h2 className={`text-4xl font-bold mb-4 tracking-tight ${isWin ? 'text-gray-800' : 'text-gray-700'}`}>
+                {isWin ? '위대한 승리' : '아쉬운 패배'}
+              </h2>
+              <p className={`font-medium mb-12 text-lg leading-relaxed ${isWin ? 'text-gray-600' : 'text-gray-500'}`}>
+                <span className={`block text-2xl mb-2 font-bold ${isWin ? 'text-emerald-600' : 'text-red-500'}`}>
+                  {modalText}
+                </span>
+                {isWin
+                  ? '숲의 가장 깊은 곳을 정복했습니다.'
+                  : '다음에는 더 강해져서 돌아오세요.'}
+              </p>
+              <button
+                onClick={() => { setWinnerModal(null); setView('lobby'); fetchLeaderboard(); }}
+                className={`w-full py-5 font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg ${
+                  isWin
+                    ? 'bg-emerald-500 hover:bg-emerald-600 text-white'
+                    : 'bg-gray-700 hover:bg-gray-800 text-white'
+                }`}
+              >
+                로비로 귀환
+              </button>
             </div>
-            <h2 className="text-4xl font-bold text-gray-800 mb-4 tracking-tight">위대한 승리</h2>
-            <p className="text-gray-600 font-medium mb-12 text-lg leading-relaxed">
-              <span className="text-emerald-600 block text-2xl mb-2 font-bold">{winnerModal}</span>
-              숲의 가장 깊은 곳을 정복했습니다.
-            </p>
-            <button
-              onClick={() => { setWinnerModal(null); setView('lobby'); }}
-              className="w-full py-5 bg-emerald-500 hover:bg-emerald-600 text-white font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg"
-            >
-              로비로 귀환
-            </button>
           </div>
-        </div>
-      )}
+        );
+      })()}
       <SpeedInsights />
     </div>
   );

@@ -22,6 +22,7 @@ import {
 } from 'firebase/firestore';
 import { Trophy, Play, Cpu, Shield, LogOut, RefreshCw, TreePine, Clock, UserPlus, Copy, Check } from 'lucide-react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
+import { Analytics } from '@vercel/analytics/react';
 
 // --- Firebase Configuration from Environment Variables ---
 const firebaseConfig = {
@@ -628,6 +629,7 @@ const App = () => {
         </div>
       )}
       <SpeedInsights />
+      <Analytics />
     </div>
   );
 };

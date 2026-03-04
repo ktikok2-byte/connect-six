@@ -207,34 +207,51 @@ const App = () => {
     setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중...");
     setElapsedTime(0);
     const startTime = Date.now();
-    const poolRef = doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', user.uid);
+    let stopped = false;
+    let poolRef;
 
+    try {
+      poolRef = doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', user.uid);
+    } catch (e) {
+      console.error('Failed to create pool ref:', e);
+      startComputerGame();
+      return;
+    }
+
+    // Write to matchmaking pool (fire-and-forget)
     setDoc(poolRef, {
       uid: user.uid,
-      username: userData?.username,
+      username: userData?.username || 'Unknown',
       timestamp: serverTimestamp(),
       gameId: null
     }).catch((err) => console.warn('Matchmaking pool write failed:', err));
 
-    let stopped = false;
-
-    const interval = setInterval(async () => {
+    // Timer interval — simple, guaranteed to work, never async
+    const timerInterval = setInterval(() => {
       if (stopped) return;
-      const now = Date.now();
-      const elapsed = Math.floor((now - startTime) / 1000);
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
       setElapsedTime(elapsed);
+    }, 1000);
+
+    // Separate polling interval for matchmaking — async Firebase operations
+    let polling = false;
+    const pollInterval = setInterval(async () => {
+      if (stopped || polling) return;
+      polling = true;
 
       try {
         // Check if someone else already matched us
         const myEntry = await getDoc(poolRef);
-        if (stopped) return;
+        if (stopped) { polling = false; return; }
         if (myEntry.exists() && myEntry.data().gameId) {
           stopped = true;
-          clearInterval(interval);
+          clearInterval(timerInterval);
+          clearInterval(pollInterval);
           matchmakingCleanup.current = null;
           const gameId = myEntry.data().gameId;
-          await deleteDoc(poolRef).catch(() => {});
+          deleteDoc(poolRef).catch(() => {});
           joinPvPGame(gameId);
+          polling = false;
           return;
         }
 
@@ -242,7 +259,7 @@ const App = () => {
         const poolSnapshot = await getDocs(
           collection(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool')
         );
-        if (stopped) return;
+        if (stopped) { polling = false; return; }
 
         const opponents = poolSnapshot.docs.filter(d => d.id !== user.uid && !d.data().gameId);
         if (opponents.length > 0) {
@@ -250,7 +267,8 @@ const App = () => {
           // Only the player with the smaller UID creates the game to avoid duplicates
           if (user.uid < opponent.id) {
             stopped = true;
-            clearInterval(interval);
+            clearInterval(timerInterval);
+            clearInterval(pollInterval);
             matchmakingCleanup.current = null;
             const gameId = await createPvPGame(opponent.data());
             // Tag both pool entries so the opponent also joins
@@ -259,8 +277,9 @@ const App = () => {
               doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', opponent.id),
               { gameId }
             ).catch(() => {});
-            await deleteDoc(poolRef).catch(() => {});
+            deleteDoc(poolRef).catch(() => {});
             joinPvPGame(gameId);
+            polling = false;
             return;
           }
           // If our uid is larger, wait for the other player to create the game
@@ -268,23 +287,27 @@ const App = () => {
         }
 
         // Timeout → fall back to AI game
-        if ((now - startTime) > MATCH_TIMEOUT) {
+        if ((Date.now() - startTime) > MATCH_TIMEOUT) {
           stopped = true;
-          clearInterval(interval);
+          clearInterval(timerInterval);
+          clearInterval(pollInterval);
           matchmakingCleanup.current = null;
-          await deleteDoc(poolRef).catch(() => {});
+          deleteDoc(poolRef).catch(() => {});
           startComputerGame();
         }
       } catch (err) {
         console.warn('Matchmaking poll error:', err);
+      } finally {
+        polling = false;
       }
-    }, 1500);
+    }, 2000);
 
     // Store cleanup so cancel button and navigation can use it
     matchmakingCleanup.current = () => {
       stopped = true;
-      clearInterval(interval);
-      deleteDoc(poolRef).catch(() => {});
+      clearInterval(timerInterval);
+      clearInterval(pollInterval);
+      if (poolRef) deleteDoc(poolRef).catch(() => {});
     };
   };
 

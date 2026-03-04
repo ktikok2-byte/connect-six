@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAnalytics } from "firebase/analytics";
 import {
@@ -14,6 +14,8 @@ import {
   getDoc,
   getDocs,
   deleteDoc,
+  updateDoc,
+  onSnapshot,
   collection,
   query,
   orderBy,
@@ -40,7 +42,7 @@ const db = getFirestore(app);
 const appId = import.meta.env.VITE_APP_ID || 'connect6-forest-v4';
 
 const BOARD_SIZE = 19;
-const MATCH_TIMEOUT = 10000;
+const MATCH_TIMEOUT = 30000;
 
 const App = () => {
   const [user, setUser] = useState(null);
@@ -56,6 +58,9 @@ const App = () => {
   const [autoCredentials, setAutoCredentials] = useState(null); // { id, pw }
   const [copied, setCopied] = useState(false);
   const [leaderboard, setLeaderboard] = useState([]);
+  const [gameMode, setGameMode] = useState(null); // 'ai' | 'pvp'
+  const [playerNumber, setPlayerNumber] = useState(0); // 1 or 2
+  const matchmakingCleanup = useRef(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
@@ -189,6 +194,14 @@ const App = () => {
     }
   };
 
+  const cancelMatchmaking = useCallback(() => {
+    if (matchmakingCleanup.current) {
+      matchmakingCleanup.current();
+      matchmakingCleanup.current = null;
+    }
+    setView('lobby');
+  }, []);
+
   const startMatchmaking = () => {
     setView('matchmaking');
     setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중...");
@@ -196,28 +209,113 @@ const App = () => {
     const startTime = Date.now();
     const poolRef = doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', user.uid);
 
-    // Fire-and-forget: don't block the timer on Firebase
-    setDoc(poolRef, { uid: user.uid, timestamp: serverTimestamp() }).catch((err) => {
-      console.warn('Matchmaking pool write failed:', err);
-    });
+    setDoc(poolRef, {
+      uid: user.uid,
+      username: userData?.username,
+      timestamp: serverTimestamp(),
+      gameId: null
+    }).catch((err) => console.warn('Matchmaking pool write failed:', err));
 
-    const interval = setInterval(() => {
+    let stopped = false;
+
+    const interval = setInterval(async () => {
+      if (stopped) return;
       const now = Date.now();
       const elapsed = Math.floor((now - startTime) / 1000);
       setElapsedTime(elapsed);
 
-      if ((now - startTime) > MATCH_TIMEOUT) {
-        clearInterval(interval);
-        deleteDoc(poolRef).catch(() => {});
-        startComputerGame();
-        return;
+      try {
+        // Check if someone else already matched us
+        const myEntry = await getDoc(poolRef);
+        if (stopped) return;
+        if (myEntry.exists() && myEntry.data().gameId) {
+          stopped = true;
+          clearInterval(interval);
+          matchmakingCleanup.current = null;
+          const gameId = myEntry.data().gameId;
+          await deleteDoc(poolRef).catch(() => {});
+          joinPvPGame(gameId);
+          return;
+        }
+
+        // Look for other players waiting
+        const poolSnapshot = await getDocs(
+          collection(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool')
+        );
+        if (stopped) return;
+
+        const opponents = poolSnapshot.docs.filter(d => d.id !== user.uid && !d.data().gameId);
+        if (opponents.length > 0) {
+          const opponent = opponents[0];
+          // Only the player with the smaller UID creates the game to avoid duplicates
+          if (user.uid < opponent.id) {
+            stopped = true;
+            clearInterval(interval);
+            matchmakingCleanup.current = null;
+            const gameId = await createPvPGame(opponent.data());
+            // Tag both pool entries so the opponent also joins
+            await updateDoc(poolRef, { gameId }).catch(() => {});
+            await updateDoc(
+              doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', opponent.id),
+              { gameId }
+            ).catch(() => {});
+            await deleteDoc(poolRef).catch(() => {});
+            joinPvPGame(gameId);
+            return;
+          }
+          // If our uid is larger, wait for the other player to create the game
+          setMatchmakingStatus("상대를 발견! 연결 중...");
+        }
+
+        // Timeout → fall back to AI game
+        if ((now - startTime) > MATCH_TIMEOUT) {
+          stopped = true;
+          clearInterval(interval);
+          matchmakingCleanup.current = null;
+          await deleteDoc(poolRef).catch(() => {});
+          startComputerGame();
+        }
+      } catch (err) {
+        console.warn('Matchmaking poll error:', err);
       }
-    }, 1000);
+    }, 1500);
+
+    // Store cleanup so cancel button and navigation can use it
+    matchmakingCleanup.current = () => {
+      stopped = true;
+      clearInterval(interval);
+      deleteDoc(poolRef).catch(() => {});
+    };
+  };
+
+  const createPvPGame = async (opponentData) => {
+    const gameRef = doc(collection(db, 'artifacts', appId, 'games'));
+    await setDoc(gameRef, {
+      player1: { uid: user.uid, username: userData?.username },
+      player2: { uid: opponentData.uid, username: opponentData.username },
+      board: Array(BOARD_SIZE * BOARD_SIZE).fill(0),
+      turn: 1,
+      moveCount: 0,
+      turnMoves: 0,
+      status: 'active',
+      winner: null,
+      createdAt: serverTimestamp()
+    });
+    return gameRef.id;
+  };
+
+  const joinPvPGame = (gameId) => {
+    setGameMode('pvp');
+    setCurrentGame({ id: gameId, mode: 'pvp' });
+    setWinnerModal(null);
+    setView('game');
   };
 
   const startComputerGame = () => {
+    setGameMode('ai');
     setCurrentGame({
       id: 'forest_ai_' + Date.now(),
+      mode: 'ai',
       board: Array(BOARD_SIZE * BOARD_SIZE).fill(0),
       turn: 1,
       moveCount: 0,
@@ -229,9 +327,39 @@ const App = () => {
   };
 
   const GameBoard = ({ game }) => {
-    const [board, setBoard] = useState(game.board);
-    const [turn, setTurn] = useState(game.turn);
+    const [board, setBoard] = useState(game.board || Array(BOARD_SIZE * BOARD_SIZE).fill(0));
+    const [turn, setTurn] = useState(game.turn || 1);
     const [turnMoves, setTurnMoves] = useState(0);
+    const [moveCount, setMoveCount] = useState(game.moveCount || 0);
+    const [myPlayerNum, setMyPlayerNum] = useState(0);
+    const [opponentName, setOpponentName] = useState('');
+    const [isMyTurn, setIsMyTurn] = useState(false);
+    const moveCountRef = useRef(game.moveCount || 0);
+
+    // PvP: subscribe to game doc for real-time sync
+    useEffect(() => {
+      if (game.mode !== 'pvp') return;
+      const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
+      const unsubscribe = onSnapshot(gameRef, (snapshot) => {
+        if (!snapshot.exists()) return;
+        const data = snapshot.data();
+        setBoard(data.board);
+        setTurn(data.turn);
+        setTurnMoves(data.turnMoves);
+        setMoveCount(data.moveCount);
+        moveCountRef.current = data.moveCount;
+
+        const pNum = data.player1.uid === user.uid ? 1 : 2;
+        setMyPlayerNum(pNum);
+        setIsMyTurn(data.turn === pNum);
+        setOpponentName(pNum === 1 ? data.player2.username : data.player1.username);
+
+        if (data.status === 'finished' && data.winner) {
+          setWinnerModal(data.winner === user.uid ? "나의 승리!" : `${pNum === 1 ? data.player2.username : data.player1.username} 승리`);
+        }
+      });
+      return () => unsubscribe();
+    }, [game.id, game.mode]);
 
     const checkWin = (idx, player, currentBoard) => {
       const x = idx % BOARD_SIZE;
@@ -254,8 +382,37 @@ const App = () => {
       return false;
     };
 
-    const handleCellClick = (idx) => {
+    const handleCellClick = async (idx) => {
       if (board[idx] !== 0 || winnerModal) return;
+
+      if (game.mode === 'pvp') {
+        // PvP: only allow moves on our turn
+        if (!isMyTurn) return;
+
+        const newBoard = [...board];
+        newBoard[idx] = turn;
+        const won = checkWin(idx, turn, newBoard);
+
+        let nextTurn = turn;
+        let nextTurnMoves = turnMoves + 1;
+        const nextMoveCount = moveCountRef.current + 1;
+        if (!won && (moveCountRef.current === 0 || nextTurnMoves === 2)) {
+          nextTurn = turn === 1 ? 2 : 1;
+          nextTurnMoves = 0;
+        }
+
+        const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
+        await updateDoc(gameRef, {
+          board: newBoard,
+          turn: won ? turn : nextTurn,
+          turnMoves: won ? nextTurnMoves : nextTurnMoves,
+          moveCount: nextMoveCount,
+          ...(won ? { status: 'finished', winner: user.uid } : {})
+        });
+        return;
+      }
+
+      // AI mode
       const newBoard = [...board];
       newBoard[idx] = turn;
 
@@ -267,14 +424,15 @@ const App = () => {
 
       let nextTurn = turn;
       let nextTurnMoves = turnMoves + 1;
-      if (game.moveCount === 0 || nextTurnMoves === 2) {
+      moveCountRef.current++;
+      if (moveCountRef.current === 1 || nextTurnMoves === 2) {
         nextTurn = turn === 1 ? 2 : 1;
         nextTurnMoves = 0;
       }
       setBoard(newBoard);
       setTurn(nextTurn);
       setTurnMoves(nextTurnMoves);
-      game.moveCount++;
+      setMoveCount(moveCountRef.current);
 
       if (nextTurn === 2) {
         setTimeout(() => triggerAiMove(newBoard, 2, nextTurnMoves), 600);
@@ -298,6 +456,7 @@ const App = () => {
 
       let nextTurn = aiPlayer;
       let nextTurnMoves = currentAiTurnMoves + 1;
+      moveCountRef.current++;
       if (nextTurnMoves === 2) {
         nextTurn = 1;
         nextTurnMoves = 0;
@@ -305,7 +464,7 @@ const App = () => {
       setBoard(newBoard);
       setTurn(nextTurn);
       setTurnMoves(nextTurnMoves);
-      game.moveCount++;
+      setMoveCount(moveCountRef.current);
       if (nextTurn === 2) setTimeout(() => triggerAiMove(newBoard, 2, nextTurnMoves), 600);
     };
 
@@ -318,16 +477,31 @@ const App = () => {
            <div className={`w-8 h-8 rounded-full shadow-md transition-all duration-500 transform ${turn === 1 ? 'bg-gray-800 scale-110' : 'bg-white scale-110 border border-gray-200'}`}></div>
            <div className="flex flex-col">
              <span className="text-gray-800 font-bold text-sm">
-               {turn === 1 ? "흑돌 차례" : "백돌 차례"}
+               {game.mode === 'pvp'
+                 ? (isMyTurn ? "내 차례" : `${opponentName}의 차례`)
+                 : (turn === 1 ? "흑돌 차례" : "백돌 차례")}
              </span>
              <div className="flex items-center gap-2 mt-1">
                <div className="flex gap-1">
                  <div className={`w-2 h-2 rounded-full ${turnMoves < 2 ? 'bg-emerald-500' : 'bg-gray-200'}`}></div>
-                 <div className={`w-2 h-2 rounded-full ${game.moveCount === 0 || turnMoves < 1 ? 'bg-emerald-500' : 'bg-gray-200'}`}></div>
+                 <div className={`w-2 h-2 rounded-full ${moveCount === 0 || turnMoves < 1 ? 'bg-emerald-500' : 'bg-gray-200'}`}></div>
                </div>
-               <span className="text-[10px] text-emerald-600 font-semibold uppercase">Ready to Move</span>
+               <span className="text-[10px] text-emerald-600 font-semibold uppercase">
+                 {game.mode === 'pvp'
+                   ? (isMyTurn ? 'Your Turn' : 'Waiting...')
+                   : 'Ready to Move'}
+               </span>
              </div>
            </div>
+           {game.mode === 'pvp' && (
+             <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
+               <div className={`w-3 h-3 rounded-full ${myPlayerNum === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+               <span>나</span>
+               <span className="text-gray-300">vs</span>
+               <div className={`w-3 h-3 rounded-full ${myPlayerNum === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+               <span>{opponentName}</span>
+             </div>
+           )}
         </div>
 
         <div className="relative group mt-2">
@@ -583,7 +757,7 @@ const App = () => {
 
              <div>
                <button
-                 onClick={() => setView('lobby')}
+                 onClick={cancelMatchmaking}
                  className="px-8 py-3 bg-gray-100 text-gray-600 hover:bg-gray-200 rounded-xl text-sm font-semibold transition-all"
                >
                  탐색 취소

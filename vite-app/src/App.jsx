@@ -189,22 +189,26 @@ const App = () => {
     }
   };
 
-  const startMatchmaking = async () => {
+  const startMatchmaking = () => {
     setView('matchmaking');
     setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중...");
     setElapsedTime(0);
     const startTime = Date.now();
     const poolRef = doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking_pool', user.uid);
-    await setDoc(poolRef, { uid: user.uid, timestamp: serverTimestamp() });
 
-    const interval = setInterval(async () => {
+    // Fire-and-forget: don't block the timer on Firebase
+    setDoc(poolRef, { uid: user.uid, timestamp: serverTimestamp() }).catch((err) => {
+      console.warn('Matchmaking pool write failed:', err);
+    });
+
+    const interval = setInterval(() => {
       const now = Date.now();
       const elapsed = Math.floor((now - startTime) / 1000);
       setElapsedTime(elapsed);
 
       if ((now - startTime) > MATCH_TIMEOUT) {
         clearInterval(interval);
-        await deleteDoc(poolRef);
+        deleteDoc(poolRef).catch(() => {});
         startComputerGame();
         return;
       }

@@ -54,6 +54,12 @@ export const translations = {
     myRank: '위',
     unranked: '-',
 
+    // Offline match
+    offlineMatch: '오프라인 대전',
+    offlineMatchDesc: '한 화면에서 두 명이 플레이',
+    blackTurn: '흑돌 차례',
+    whiteTurn: '백돌 차례',
+
     // Friend match
     friendMatch: '친선 대전',
     friendMatchDesc: '친구와 대전하기',
@@ -182,6 +188,12 @@ export const translations = {
     myStats: 'My Stats',
     myRank: '',
     unranked: '-',
+
+    // Offline match
+    offlineMatch: 'Offline Match',
+    offlineMatchDesc: 'Two players, one screen',
+    blackTurn: "Black's Turn",
+    whiteTurn: "White's Turn",
 
     // Friend match
     friendMatch: 'Friend Match',

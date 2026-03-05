@@ -25,7 +25,7 @@ import {
   runTransaction,
   arrayUnion
 } from 'firebase/firestore';
-import { Trophy, Play, Cpu, Shield, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Trophy, Play, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight, Gamepad2 } from 'lucide-react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import { Analytics } from '@vercel/analytics/react';
 import { translations } from './translations';
@@ -489,6 +489,21 @@ const App = () => {
     setView('game');
   };
 
+  const startLocalGame = () => {
+    setGameMode('local');
+    setCurrentGame({
+      id: 'local_' + Date.now(),
+      mode: 'local',
+      board: Array(BOARD_SIZE * BOARD_SIZE).fill(0),
+      turn: 1,
+      moveCount: 0,
+      turnMoves: 0,
+      status: 'active',
+    });
+    setWinnerModal(null);
+    setView('game');
+  };
+
   // --- Friend Match ---
   const sendFriendInvite = async () => {
     if (!friendUsername.trim()) return;
@@ -622,33 +637,35 @@ const App = () => {
   // --- Game History ---
   const fetchGameHistory = async () => {
     try {
+      // No orderBy to avoid requiring a composite Firestore index; sort client-side
       const q = query(
         collection(db, 'artifacts', appId, 'games'),
         where('playerUids', 'array-contains', user.uid),
-        orderBy('createdAt', 'desc'),
-        firestoreLimit(30)
+        firestoreLimit(50)
       );
       const snapshot = await getDocs(q);
       const games = snapshot.docs.map(d => {
         const data = d.data();
-        const isPlayer1 = data.player1.uid === user.uid;
+        const isPlayer1 = data.player1?.uid === user.uid;
+        const winnerUid = data.winner && !data.winner.startsWith('player')
+          ? data.winner
+          : data.winner === 'player1' ? data.player1?.uid : data.winner === 'player2' ? data.player2?.uid : null;
         return {
           id: d.id,
           player1: data.player1,
           player2: data.player2,
           opponentName: isPlayer1 ? data.player2?.username : data.player1?.username,
-          result: data.winner === user.uid ? 'win'
-            : (data.winner && data.winner !== user.uid) ? 'loss'
-            : (data.status === 'finished' && data.winner?.includes?.('player'))
-              ? (((data.winner === 'player1') === isPlayer1) ? 'win' : 'loss')
-              : 'unknown',
+          result: !winnerUid ? 'unknown' : winnerUid === user.uid ? 'win' : 'loss',
           date: data.createdAt?.toDate?.()?.toLocaleDateString() || '',
+          dateMs: data.createdAt?.toMillis?.() || 0,
           mode: data.friendMatch ? 'friendly' : 'ranked',
           moves: data.moves || [],
           winReason: data.winReason,
           status: data.status,
         };
-      }).filter(g => g.status === 'finished');
+      })
+        .filter(g => g.status === 'finished' && g.result !== 'unknown')
+        .sort((a, b) => b.dateMs - a.dateMs);
       setGameHistoryList(games);
     } catch (err) {
       console.error('Game history fetch failed:', err);
@@ -856,6 +873,29 @@ const App = () => {
         return;
       }
 
+      // Local 2-player mode (both players on same screen)
+      if (game.mode === 'local') {
+        const newBoard = [...board];
+        newBoard[idx] = turn;
+        if (checkWin(idx, turn, newBoard)) {
+          setBoard(newBoard);
+          setWinnerModal({ text: turn === 1 ? t('blackWins') : t('whiteWins'), isWinner: true });
+          return;
+        }
+        let nextTurn = turn;
+        let nextTurnMoves = turnMoves + 1;
+        moveCountRef.current++;
+        if (moveCountRef.current === 1 || nextTurnMoves === 2) {
+          nextTurn = turn === 1 ? 2 : 1;
+          nextTurnMoves = 0;
+        }
+        setBoard(newBoard);
+        setTurn(nextTurn);
+        setTurnMoves(nextTurnMoves);
+        setMoveCount(moveCountRef.current);
+        return;
+      }
+
       // AI mode
       const humanPlayer = game.humanPlayer || 1;
       const aiPlayer = game.aiPlayer || 2;
@@ -888,12 +928,75 @@ const App = () => {
       if (nextTurn === aiPlayer) setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), 600);
     };
 
+    // Score a candidate cell for AI placement
+    const scoreCell = (board, idx, aiPlayer, humanPlayer) => {
+      const dirs = [[1,0],[0,1],[1,1],[1,-1]];
+      const x = idx % BOARD_SIZE;
+      const y = Math.floor(idx / BOARD_SIZE);
+
+      const countDir = (dx, dy, player) => {
+        let cnt = 0;
+        for (let i = 1; i < 6; i++) {
+          const nx = x + dx * i, ny = y + dy * i;
+          if (nx < 0 || nx >= BOARD_SIZE || ny < 0 || ny >= BOARD_SIZE) break;
+          if (board[ny * BOARD_SIZE + nx] === player) cnt++; else break;
+        }
+        return cnt;
+      };
+
+      let aiMax = 0, humanMax = 0;
+      for (const [dx, dy] of dirs) {
+        const aiChain = 1 + countDir(dx, dy, aiPlayer) + countDir(-dx, -dy, aiPlayer);
+        const humanChain = 1 + countDir(dx, dy, humanPlayer) + countDir(-dx, -dy, humanPlayer);
+        if (aiChain > aiMax) aiMax = aiChain;
+        if (humanChain > humanMax) humanMax = humanChain;
+      }
+
+      // Win immediately
+      if (aiMax >= 6) return 100000;
+      // Block human win
+      if (humanMax >= 6) return 90000;
+      // Build 5-chain (one away from win)
+      if (aiMax === 5) return 10000;
+      // Block human 5
+      if (humanMax === 5) return 9000;
+      // Build 4
+      if (aiMax === 4) return 1000;
+      // Block human 4
+      if (humanMax === 4) return 900;
+      // Build 3
+      if (aiMax === 3) return 100;
+      // Block human 3
+      if (humanMax === 3) return 90;
+      // Build 2
+      if (aiMax === 2) return 10;
+      // Block human 2
+      if (humanMax === 2) return 9;
+      // Adjacent to any human stone
+      const adj8 = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
+      for (const [adx, ady] of adj8) {
+        const nx = x + adx, ny = y + ady;
+        if (nx >= 0 && nx < BOARD_SIZE && ny >= 0 && ny < BOARD_SIZE) {
+          if (board[ny * BOARD_SIZE + nx] === humanPlayer) return 1;
+        }
+      }
+      return 0;
+    };
+
     const triggerAiMove = (currentBoard, aiPlayer, currentAiTurnMoves) => {
       if (winnerModal) return;
+      const humanPlayer = game.humanPlayer || (aiPlayer === 1 ? 2 : 1);
       const emptyIndices = currentBoard.map((c, i) => c === 0 ? i : -1).filter(i => i !== -1);
       if (emptyIndices.length === 0) return;
 
-      const aiIdx = emptyIndices[Math.floor(Math.random() * emptyIndices.length)];
+      // Score all empty cells, pick the best (with small random tiebreak)
+      let bestScore = -1, bestIdx = emptyIndices[0];
+      for (const idx of emptyIndices) {
+        const score = scoreCell(currentBoard, idx, aiPlayer, humanPlayer) + Math.random() * 0.5;
+        if (score > bestScore) { bestScore = score; bestIdx = idx; }
+      }
+
+      const aiIdx = bestIdx;
       const newBoard = [...currentBoard];
       newBoard[aiIdx] = aiPlayer;
 
@@ -975,6 +1078,15 @@ const App = () => {
                <span className="text-gray-300">vs</span>
                <div className={`w-3 h-3 rounded-full ${humanPlayer === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
                <span>AI</span>
+             </div>
+           )}
+           {game.mode === 'local' && (
+             <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
+               <div className="w-3 h-3 rounded-full bg-gray-800"></div>
+               <span>{t('blackTurn')?.split(' ')[0]}</span>
+               <span className="text-gray-300">vs</span>
+               <div className="w-3 h-3 rounded-full bg-white border border-gray-300"></div>
+               <span>{t('whiteTurn')?.split(' ')[0]}</span>
              </div>
            )}
         </div>
@@ -1273,127 +1385,133 @@ const App = () => {
 
       {/* === LOBBY === */}
       {view === 'lobby' && (
-        <div className="relative z-10 p-8 md:p-16 max-w-7xl mx-auto">
-          <header className="flex flex-col md:flex-row justify-between items-start md:items-end mb-16 gap-6">
+        <div className="relative z-10 p-8 md:p-12 max-w-7xl mx-auto">
+          <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-10 gap-4">
             <div>
-              <span className="text-emerald-500 font-semibold tracking-wider text-xs uppercase mb-2 block">{t('lobbySubtitle')}</span>
-              <h1 className="text-5xl font-bold tracking-tight text-gray-800">{t('lobbyTitle')}</h1>
+              <span className="text-emerald-500 font-semibold tracking-wider text-xs uppercase mb-1 block">{t('lobbySubtitle')}</span>
+              <h1 className="text-4xl font-bold tracking-tight text-gray-800">{t('lobbyTitle')}</h1>
             </div>
-            <div className="flex items-center gap-6 bg-white/70 p-4 pr-8 rounded-full border border-white backdrop-blur-md shadow-sm">
-               <div className="w-14 h-14 bg-emerald-100 rounded-full flex items-center justify-center font-bold text-emerald-700 text-2xl shadow-inner border border-emerald-200">
-                 {userData?.username?.[0]}
-               </div>
-               <div>
-                 <div className="text-lg font-bold text-gray-800 tracking-tight flex items-center gap-2">
-                   {userData?.username}
-                   {userRank && (
-                     <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded-full font-bold">#{userRank}</span>
-                   )}
-                 </div>
-                 <div className="text-[11px] text-gray-500 font-medium mt-1 flex items-center gap-3">
-                   <div className="flex items-center gap-1">
-                     <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                     <span className="text-emerald-600">{t('online')}</span>
-                   </div>
-                   <span>{userData?.wins || 0}{t('winsLabel')} {userData?.losses || 0}{t('lossesLabel')}</span>
-                   <span className="text-emerald-500 font-bold">
-                     {userData?.totalGames > 0 ? ((userData.wins / userData.totalGames) * 100).toFixed(1) : '0.0'}%
-                   </span>
-                 </div>
-               </div>
-               <div className="ml-4 flex items-center gap-2">
-                 <select value={lang} onChange={(e) => handleLangChange(e.target.value)} className="text-xs border border-gray-200 rounded-lg px-2 py-1 bg-white text-gray-600 focus:ring-2 focus:ring-emerald-400 outline-none">
-                   <option value="ko">한국어</option>
-                   <option value="en">English</option>
-                 </select>
-                 <button onClick={() => auth.signOut()} className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-all"><LogOut size={20} /></button>
-               </div>
+            <div className="flex items-center gap-3">
+              <select value={lang} onChange={(e) => handleLangChange(e.target.value)} className="text-xs border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-600 focus:ring-2 focus:ring-emerald-400 outline-none">
+                <option value="ko">한국어</option>
+                <option value="en">English</option>
+              </select>
+              <button onClick={() => auth.signOut()} className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-all"><LogOut size={20} /></button>
             </div>
           </header>
 
           {/* Pending invite banner */}
           {pendingInvite && (
-            <div className="mb-8 bg-amber-50 border border-amber-200 rounded-2xl p-6 flex items-center justify-between animate-pulse">
+            <div className="mb-6 bg-amber-50 border border-amber-200 rounded-2xl p-5 flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <Users size={24} className="text-amber-600" />
-                <span className="font-bold text-amber-800">
+                <Users size={22} className="text-amber-600" />
+                <span className="font-bold text-amber-800 text-sm">
                   {pendingInvite.data().fromUsername}{t('pendingInviteFrom')}
                 </span>
                 <span className="text-xs text-amber-600">{t('friendMatchNote')}</span>
               </div>
-              <div className="flex gap-3">
-                <button onClick={acceptInvite} className="px-6 py-2 bg-emerald-500 text-white rounded-xl font-semibold hover:bg-emerald-600 transition-all">{t('acceptInvite')}</button>
-                <button onClick={declineInvite} className="px-6 py-2 bg-gray-200 text-gray-600 rounded-xl font-semibold hover:bg-gray-300 transition-all">{t('declineInvite')}</button>
+              <div className="flex gap-2">
+                <button onClick={acceptInvite} className="px-5 py-2 bg-emerald-500 text-white rounded-xl text-sm font-semibold hover:bg-emerald-600 transition-all">{t('acceptInvite')}</button>
+                <button onClick={declineInvite} className="px-5 py-2 bg-gray-200 text-gray-600 rounded-xl text-sm font-semibold hover:bg-gray-300 transition-all">{t('declineInvite')}</button>
               </div>
             </div>
           )}
 
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
-            <div className="lg:col-span-2 space-y-10">
-              {/* Ranked PvP */}
-              <div onClick={startMatchmaking} className="relative group bg-white/80 p-12 rounded-[3rem] shadow-sm cursor-pointer overflow-hidden transition-all hover:shadow-md border border-white hover:border-emerald-100">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            {/* LEFT: Ranked match + action buttons */}
+            <div className="lg:col-span-2 space-y-6">
+              {/* Ranked PvP — big card */}
+              <div onClick={startMatchmaking} className="relative group bg-white/80 p-10 rounded-[3rem] shadow-sm cursor-pointer overflow-hidden transition-all hover:shadow-md border border-white hover:border-emerald-100">
                 <div className="relative z-10">
-                  <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-full text-xs font-semibold text-emerald-600 mb-6 border border-emerald-100">
+                  <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-full text-xs font-semibold text-emerald-600 mb-5 border border-emerald-100">
                     {t('matchAvailable')}
                   </div>
-                  <h2 className="text-4xl font-bold mb-4 text-gray-800 tracking-tight">{t('pvpTitle')}</h2>
-                  <p className="text-gray-500 max-w-sm mb-12 text-base leading-relaxed">{t('pvpDesc')}</p>
+                  <h2 className="text-4xl font-bold mb-3 text-gray-800 tracking-tight">{t('pvpTitle')}</h2>
+                  <p className="text-gray-500 max-w-sm mb-8 text-sm leading-relaxed">{t('pvpDesc')}</p>
                   <div className="inline-flex items-center gap-3 bg-emerald-500 text-white px-8 py-4 rounded-2xl font-semibold text-sm shadow-md group-hover:bg-emerald-600 transition-colors">
                     {t('startMatch')} <Play size={18} fill="currentColor" />
                   </div>
                 </div>
               </div>
 
-              {/* AI + Friend + History */}
-              <div className="grid grid-cols-2 gap-6">
-                <button onClick={startComputerGame} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-emerald-200 hover:bg-white shadow-sm transition-all text-left group">
-                  <Cpu className="text-emerald-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('aiTitle')}</h3>
-                  <p className="text-xs text-gray-500 font-medium">{t('aiSubtitle')}</p>
+              {/* Friend + Offline + History */}
+              <div className="grid grid-cols-3 gap-4">
+                <button onClick={() => { setFriendUsername(''); setError(''); setView('friendMatch'); }} className="p-6 bg-white/70 rounded-[2rem] border border-white hover:border-blue-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <Users className="text-blue-400 mb-4 w-8 h-8 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-lg font-bold text-gray-800 tracking-tight mb-1">{t('friendMatch')}</h3>
+                  <p className="text-xs text-gray-400">{t('friendMatchDesc')}</p>
                 </button>
-                <button onClick={() => { setFriendUsername(''); setError(''); setView('friendMatch'); }} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-blue-200 hover:bg-white shadow-sm transition-all text-left group">
-                  <Users className="text-blue-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('friendMatch')}</h3>
-                  <p className="text-xs text-gray-500 font-medium">{t('friendMatchDesc')}</p>
+                <button onClick={startLocalGame} className="p-6 bg-white/70 rounded-[2rem] border border-white hover:border-purple-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <Gamepad2 className="text-purple-400 mb-4 w-8 h-8 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-lg font-bold text-gray-800 tracking-tight mb-1">{t('offlineMatch')}</h3>
+                  <p className="text-xs text-gray-400">{t('offlineMatchDesc')}</p>
                 </button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-6">
-                <button onClick={startComputerGame} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-teal-200 hover:bg-white shadow-sm transition-all text-left group">
-                  <Shield className="text-teal-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('challengeTitle')}</h3>
-                  <p className="text-xs text-gray-500 font-medium">{t('challengeSubtitle')}</p>
-                </button>
-                <button onClick={() => { fetchGameHistory(); setView('history'); }} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-purple-200 hover:bg-white shadow-sm transition-all text-left group">
-                  <History className="text-purple-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('gameHistory')}</h3>
-                  <p className="text-xs text-gray-500 font-medium">{t('gameHistoryDesc')}</p>
+                <button onClick={() => { fetchGameHistory(); setView('history'); }} className="p-6 bg-white/70 rounded-[2rem] border border-white hover:border-amber-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <History className="text-amber-400 mb-4 w-8 h-8 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-lg font-bold text-gray-800 tracking-tight mb-1">{t('gameHistory')}</h3>
+                  <p className="text-xs text-gray-400">{t('gameHistoryDesc')}</p>
                 </button>
               </div>
             </div>
 
-            {/* Leaderboard */}
-            <div className="bg-white/70 rounded-[3rem] border border-white shadow-sm p-10 backdrop-blur-md">
-              <div className="flex items-center justify-between mb-10">
-                <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2">
-                  <Trophy size={20} className="text-yellow-500" /> {t('hallOfFame')}
-                </h3>
-              </div>
-              <div className="space-y-6">
-                {leaderboard.length === 0 ? (
-                  <p className="text-gray-400 text-sm text-center py-4">{t('noRecords')}</p>
-                ) : leaderboard.map((player, i) => (
-                  <div key={player.uid} className="flex justify-between items-center group w-full">
-                    <div className="flex items-center gap-4 flex-1">
-                      <span className={`text-xs w-7 h-7 flex items-center justify-center rounded-full font-bold shrink-0 ${i === 0 ? 'bg-yellow-100 text-yellow-700' : i === 1 ? 'bg-gray-200 text-gray-600' : i === 2 ? 'bg-orange-100 text-orange-600' : 'bg-gray-100 text-gray-500'}`}>{i + 1}</span>
-                      <span className="font-medium text-gray-600 group-hover:text-gray-900 transition-colors truncate">{player.username}</span>
+            {/* RIGHT: User info + Rankings */}
+            <div className="space-y-4">
+              {/* User info card */}
+              <div className="bg-white/70 rounded-[2rem] border border-white shadow-sm p-6 backdrop-blur-md">
+                <div className="flex items-center gap-4 mb-4">
+                  <div className="w-12 h-12 bg-emerald-100 rounded-full flex items-center justify-center font-bold text-emerald-700 text-xl shadow-inner border border-emerald-200">
+                    {userData?.username?.[0]}
+                  </div>
+                  <div>
+                    <div className="font-bold text-gray-800 flex items-center gap-2">
+                      {userData?.username}
+                      {userRank && <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded-full font-bold">#{userRank}</span>}
                     </div>
-                    <div className="flex items-center gap-3 ml-4 shrink-0">
-                      <span className="text-xs text-gray-400">{player.wins}{t('winsLabel')} {player.losses}{t('lossesLabel')}</span>
-                      <span className="font-semibold text-emerald-500 text-sm">{player.totalGames > 0 ? ((player.wins / player.totalGames) * 100).toFixed(1) : '0.0'}%</span>
+                    <div className="flex items-center gap-1 mt-0.5">
+                      <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
+                      <span className="text-xs text-emerald-600">{t('online')}</span>
                     </div>
                   </div>
-                ))}
+                </div>
+                <div className="grid grid-cols-3 gap-3 text-center">
+                  <div className="bg-emerald-50 rounded-xl py-2">
+                    <div className="text-lg font-bold text-emerald-700">{userData?.wins || 0}</div>
+                    <div className="text-[10px] text-gray-400">{t('winsLabel')}</div>
+                  </div>
+                  <div className="bg-red-50 rounded-xl py-2">
+                    <div className="text-lg font-bold text-red-600">{userData?.losses || 0}</div>
+                    <div className="text-[10px] text-gray-400">{t('lossesLabel')}</div>
+                  </div>
+                  <div className="bg-blue-50 rounded-xl py-2">
+                    <div className="text-lg font-bold text-blue-600">
+                      {userData?.totalGames > 0 ? ((userData.wins / userData.totalGames) * 100).toFixed(0) : 0}%
+                    </div>
+                    <div className="text-[10px] text-gray-400">Win%</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Rankings */}
+              <div className="bg-white/70 rounded-[2rem] border border-white shadow-sm p-6 backdrop-blur-md">
+                <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2 mb-6">
+                  <Trophy size={18} className="text-yellow-500" /> {t('hallOfFame')}
+                </h3>
+                <div className="space-y-4">
+                  {leaderboard.length === 0 ? (
+                    <p className="text-gray-400 text-xs text-center py-2">{t('noRecords')}</p>
+                  ) : leaderboard.map((player, i) => (
+                    <div key={player.uid} className={`flex justify-between items-center group w-full rounded-xl px-2 py-1 ${player.uid === userData?.uid ? 'bg-emerald-50' : ''}`}>
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        <span className={`text-xs w-6 h-6 flex items-center justify-center rounded-full font-bold shrink-0 ${i === 0 ? 'bg-yellow-100 text-yellow-700' : i === 1 ? 'bg-gray-200 text-gray-600' : i === 2 ? 'bg-orange-100 text-orange-600' : 'bg-gray-100 text-gray-500'}`}>{i + 1}</span>
+                        <span className={`font-medium text-sm truncate ${player.uid === userData?.uid ? 'text-emerald-700 font-bold' : 'text-gray-600'}`}>{player.username}</span>
+                      </div>
+                      <div className="flex items-center gap-2 ml-2 shrink-0">
+                        <span className="text-[10px] text-gray-400">{player.wins}{t('winsLabel')}</span>
+                        <span className="font-semibold text-emerald-500 text-xs">{player.totalGames > 0 ? ((player.wins / player.totalGames) * 100).toFixed(0) : 0}%</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           </div>
@@ -1523,6 +1641,48 @@ const App = () => {
               {t('returnToLobby')}
             </button>
           </header>
+
+          {/* Win rate graph (oldest→newest, left→right) */}
+          {gameHistoryList.length >= 2 && (() => {
+            const sorted = [...gameHistoryList].reverse(); // oldest first
+            let wins = 0;
+            const points = sorted.map((g, i) => {
+              if (g.result === 'win') wins++;
+              return { x: i, rate: Math.round((wins / (i + 1)) * 100) };
+            });
+            const W = 600, H = 120, PAD = 16;
+            const xStep = (W - PAD * 2) / Math.max(points.length - 1, 1);
+            const toX = (i) => PAD + i * xStep;
+            const toY = (r) => PAD + (H - PAD * 2) * (1 - r / 100);
+            const polyline = points.map(p => `${toX(p.x).toFixed(1)},${toY(p.rate).toFixed(1)}`).join(' ');
+            const lastPt = points[points.length - 1];
+            return (
+              <div className="mb-6 bg-white/80 rounded-2xl border border-white shadow-sm p-5">
+                <div className="flex justify-between items-center mb-3">
+                  <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Win Rate Trend</span>
+                  <span className="text-sm font-bold text-emerald-600">{lastPt?.rate ?? 0}%</span>
+                </div>
+                <svg width="100%" viewBox={`0 0 ${W} ${H}`} className="overflow-visible">
+                  {/* Grid lines */}
+                  {[0, 25, 50, 75, 100].map(r => (
+                    <g key={r}>
+                      <line x1={PAD} y1={toY(r)} x2={W - PAD} y2={toY(r)} stroke="#e5e7eb" strokeWidth="1" />
+                      <text x={PAD - 4} y={toY(r) + 4} textAnchor="end" fontSize="9" fill="#9ca3af">{r}%</text>
+                    </g>
+                  ))}
+                  {/* Area fill */}
+                  <polygon
+                    points={`${toX(0).toFixed(1)},${H - PAD} ${polyline} ${toX(points.length - 1).toFixed(1)},${H - PAD}`}
+                    fill="rgba(16,185,129,0.08)"
+                  />
+                  {/* Line */}
+                  <polyline points={polyline} fill="none" stroke="#10b981" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+                  {/* Last point dot */}
+                  <circle cx={toX(lastPt.x)} cy={toY(lastPt.rate)} r="4" fill="#10b981" />
+                </svg>
+              </div>
+            );
+          })()}
 
           <div className="space-y-4">
             {gameHistoryList.length === 0 ? (

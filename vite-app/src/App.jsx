@@ -408,13 +408,25 @@ const App = () => {
     };
 
     unsubPool = onSnapshot(
-      query(poolCollectionPath, orderBy('timestamp', 'desc')),
+      query(poolCollectionPath),
       (snapshot) => {
         if (stopped) return;
-        cachedDocs = snapshot.docs;
+        // Sort client-side by enteredAt to avoid serverTimestamp null issues on mobile
+        cachedDocs = [...snapshot.docs].sort((a, b) => (b.data().enteredAt || 0) - (a.data().enteredAt || 0));
         checkForMatch(cachedDocs);
       },
-      (err) => { console.warn('Pool onSnapshot failed:', err); }
+      (err) => {
+        console.warn('Pool onSnapshot failed, falling back to polling:', err);
+        // On mobile, onSnapshot may fail — fall back to getDocs polling
+        recheckInterval = setInterval(async () => {
+          if (stopped) return;
+          try {
+            const snap = await getDocs(poolCollectionPath);
+            cachedDocs = [...snap.docs].sort((a, b) => (b.data().enteredAt || 0) - (a.data().enteredAt || 0));
+            checkForMatch(cachedDocs);
+          } catch (e) { /* ignore */ }
+        }, 3000);
+      }
     );
 
     recheckInterval = setInterval(() => {
@@ -1804,7 +1816,7 @@ const App = () => {
                   </div>
                 </div>
               ) : (
-                <div onClick={startMatchmaking} className="relative group bg-white/80 p-10 rounded-[3rem] shadow-sm cursor-pointer overflow-hidden transition-all hover:shadow-md border border-white hover:border-emerald-100">
+                <button onClick={startMatchmaking} className="relative group w-full text-left bg-white/80 p-10 rounded-[3rem] shadow-sm overflow-hidden transition-all hover:shadow-md border border-white hover:border-emerald-100 active:scale-[0.98]">
                   <div className="relative z-10">
                     <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-full text-xs font-semibold text-emerald-600 mb-5 border border-emerald-100">
                       {t('matchAvailable')}
@@ -1815,11 +1827,11 @@ const App = () => {
                       {t('startMatch')} <Play size={18} fill="currentColor" />
                     </div>
                   </div>
-                </div>
+                </button>
               )}
 
               {/* Friend + Offline + History + Observe */}
-              <div className="grid grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <button onClick={() => { setFriendUsername(''); setError(''); setView('friendMatch'); }} className="p-5 bg-white/70 rounded-[2rem] border border-white hover:border-blue-200 hover:bg-white shadow-sm transition-all text-left group">
                   <Users className="text-blue-400 mb-3 w-7 h-7 group-hover:scale-110 transition-transform" />
                   <h3 className="text-base font-bold text-gray-800 tracking-tight mb-1">{t('friendMatch')}</h3>

@@ -51,8 +51,7 @@ const MATCH_TIMEOUT = 30000;
 const TURN_TIME_LIMIT = 30; // seconds per turn
 
 const AI_BOT_UID = 'ai_bot_v1';
-const AI_BOT_DISPLAY_NAME = 'AI Bot';
-const AI_BOT_NAMES = ['AlphaStone', 'NeuralGo', 'BotPlayer', 'DeepSix', 'StoneMind', 'ZenMove', 'ProPlayer', 'NextMove'];
+const AI_BOT_DISPLAY_NAME = 'Player_' + AI_BOT_UID.slice(0, 4); // = 'Player_ai_b'
 
 const App = () => {
   const [user, setUser] = useState(null);
@@ -88,6 +87,10 @@ const App = () => {
   // Observe mode state
   const [observeUsername, setObserveUsername] = useState('');
   const [observeGameId, setObserveGameId] = useState(null);
+
+  // Rejoin active game state
+  const [rejoinGame, setRejoinGame] = useState(null);
+  const [rejoinCountdown, setRejoinCountdown] = useState(TURN_TIME_LIMIT);
 
   // Opponent left notification
   const [opponentLeftMsg, setOpponentLeftMsg] = useState(false);
@@ -471,19 +474,52 @@ const App = () => {
 
   const joinPvPGame = (gameId) => {
     gameResultHandled.current = false;
+    // Store active game ID in user profile for rejoin detection
+    if (user) {
+      updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { activeGameId: gameId }).catch(() => {});
+    }
+    setRejoinGame(null);
     setGameMode('pvp');
     setCurrentGame({ id: gameId, mode: 'pvp' });
     setWinnerModal(null);
     setView('game');
   };
 
+  const clearActiveGame = () => {
+    if (user) {
+      updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { activeGameId: null }).catch(() => {});
+    }
+  };
+
+  // Called when player leaves game view (Return to Lobby button)
+  const handleLeaveGame = async () => {
+    if (currentGame?.mode === 'pvp' && !winnerModal) {
+      // Active PvP game: mark player as left but keep game running so they can rejoin
+      try {
+        const gameRef = doc(db, 'artifacts', appId, 'games', currentGame.id);
+        const snap = await getDoc(gameRef);
+        if (snap.exists() && snap.data().status === 'active') {
+          await updateDoc(gameRef, { leftDuringGame: arrayUnion(user.uid) });
+          // Do NOT clear activeGameId — keep it so they can rejoin from lobby
+          setWinnerModal(null);
+          setView('lobby');
+          return;
+        }
+      } catch (e) { console.error('handleLeaveGame error:', e); }
+    }
+    // Non-PvP or game already finished: clear activeGameId
+    clearActiveGame();
+    setWinnerModal(null);
+    setView('lobby');
+    fetchLeaderboard();
+  };
+
   const startComputerGame = () => {
-    const randomArray = new Uint32Array(2);
+    const randomArray = new Uint32Array(1);
     crypto.getRandomValues(randomArray);
     const playerIsBlack = randomArray[0] % 2 === 0;
     const humanPlayer = playerIsBlack ? 1 : 2;
     const aiPlayer = playerIsBlack ? 2 : 1;
-    const aiName = AI_BOT_NAMES[randomArray[1] % AI_BOT_NAMES.length];
 
     ensureAiBotExists().catch(() => {});
 
@@ -498,7 +534,6 @@ const App = () => {
       status: 'active',
       humanPlayer,
       aiPlayer,
-      aiName,
       moves: [],
     });
     setWinnerModal(null);
@@ -739,6 +774,48 @@ const App = () => {
     return idx >= 0 ? idx + 1 : null;
   }, [leaderboard, userData]);
 
+  // Subscribe to active game for rejoin detection (when in lobby)
+  useEffect(() => {
+    if (!user || view !== 'lobby' || !userData?.activeGameId) {
+      setRejoinGame(null);
+      return;
+    }
+    const gameRef = doc(db, 'artifacts', appId, 'games', userData.activeGameId);
+    const unsub = onSnapshot(gameRef, (snap) => {
+      if (!snap.exists() || snap.data().status !== 'active') {
+        setRejoinGame(null);
+        clearActiveGame();
+        return;
+      }
+      const data = snap.data();
+      const myPlayerNum = data.player1.uid === user.uid ? 1 : 2;
+      setRejoinGame({
+        id: userData.activeGameId,
+        myPlayerNum,
+        lastMoveAt: data.lastMoveAt,
+        turn: data.turn,
+        player1: data.player1,
+        player2: data.player2,
+      });
+    });
+    return () => unsub();
+  }, [user, view, userData?.activeGameId]);
+
+  // Countdown for rejoin (how many seconds left before I lose due to timeout)
+  useEffect(() => {
+    if (!rejoinGame) { setRejoinCountdown(TURN_TIME_LIMIT); return; }
+    const interval = setInterval(() => {
+      const isMyTurn = rejoinGame.turn === rejoinGame.myPlayerNum;
+      if (isMyTurn) {
+        const elapsed = (Date.now() - (rejoinGame.lastMoveAt || Date.now())) / 1000;
+        setRejoinCountdown(Math.max(0, Math.ceil(TURN_TIME_LIMIT - elapsed)));
+      } else {
+        setRejoinCountdown(TURN_TIME_LIMIT);
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [rejoinGame]);
+
   // --- GameBoard Component ---
   const GameBoard = ({ game }) => {
     const [board, setBoard] = useState(game.board || Array(BOARD_SIZE * BOARD_SIZE).fill(0));
@@ -756,6 +833,7 @@ const App = () => {
     const timeoutClaimRef = useRef(false);
     const [aiMoves, setAiMoves] = useState([]);
     const [pendingMoveIdx, setPendingMoveIdx] = useState(null);
+    const opponentUidRef = useRef('');
 
     // AI first move when AI is black
     useEffect(() => {
@@ -797,15 +875,31 @@ const App = () => {
         const remaining = Math.max(0, TURN_TIME_LIMIT - elapsed);
         setTurnTimeLeft(Math.ceil(remaining));
 
-        if (remaining <= 0 && isMyTurn && !timeoutClaimRef.current) {
+        if (remaining <= 0 && !timeoutClaimRef.current) {
           timeoutClaimRef.current = true;
           const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
-          updateDoc(gameRef, {
-            status: 'finished',
-            winner: myPlayerNum === 1 ? 'player2' : 'player1',
-            loser: user.uid,
-            winReason: 'timeout'
-          }).catch(console.error);
+          if (isMyTurn) {
+            // My turn ran out — I lose
+            updateDoc(gameRef, {
+              status: 'finished',
+              winner: myPlayerNum === 1 ? 'player2' : 'player1',
+              loser: user.uid,
+              winReason: 'timeout'
+            }).catch(console.error);
+          } else {
+            // Opponent's turn ran out — I win (use transaction to avoid conflict)
+            runTransaction(db, async (tx) => {
+              const snap = await tx.get(gameRef);
+              if (snap.exists() && snap.data().status === 'active') {
+                tx.update(gameRef, {
+                  status: 'finished',
+                  winner: myPlayerNum === 1 ? 'player1' : 'player2',
+                  loser: opponentUidRef.current,
+                  winReason: 'timeout'
+                });
+              }
+            }).catch(console.error);
+          }
         }
       }, 200);
       return () => clearInterval(turnTimerRef.current);
@@ -826,6 +920,7 @@ const App = () => {
         moveCountRef.current = data.moveCount;
 
         const pNum = data.player1.uid === user.uid ? 1 : 2;
+        opponentUidRef.current = pNum === 1 ? data.player2.uid : data.player1.uid;
         setMyPlayerNum(pNum);
         setIsMyTurn(data.turn === pNum && data.status === 'active');
         setOpponentName(pNum === 1 ? data.player2.username : data.player1.username);
@@ -1174,7 +1269,7 @@ const App = () => {
              <span className="text-gray-800 font-bold text-sm">
                {game.mode === 'pvp'
                  ? (isMyTurn ? t('myTurn') : `${opponentName}${t('opponentTurnOf')}`)
-                 : (isHumanTurn ? t('myTurn') : `${game.aiName || 'AI'}${t('opponentTurnOf')}`)}
+                 : (isHumanTurn ? t('myTurn') : `${AI_BOT_DISPLAY_NAME}${t('opponentTurnOf')}`)}
              </span>
              <div className="flex items-center gap-2 mt-1">
                <div className="flex gap-1">
@@ -1212,7 +1307,7 @@ const App = () => {
                  <span>{t('me')}</span>
                  <span className="text-gray-300">vs</span>
                  <div className={`w-3 h-3 rounded-full ${humanPlayer === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-                 <span>{game.aiName || 'AI'}</span>
+                 <span>{AI_BOT_DISPLAY_NAME}</span>
                </div>
                <div className="ml-4 flex items-center gap-2">
                  <Timer size={16} className={timerTextColor} />
@@ -1665,19 +1760,48 @@ const App = () => {
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
             {/* LEFT: Ranked match + action buttons */}
             <div className="lg:col-span-2 space-y-6">
-              {/* Ranked PvP — big card */}
-              <div onClick={startMatchmaking} className="relative group bg-white/80 p-10 rounded-[3rem] shadow-sm cursor-pointer overflow-hidden transition-all hover:shadow-md border border-white hover:border-emerald-100">
-                <div className="relative z-10">
-                  <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-full text-xs font-semibold text-emerald-600 mb-5 border border-emerald-100">
-                    {t('matchAvailable')}
-                  </div>
-                  <h2 className="text-4xl font-bold mb-3 text-gray-800 tracking-tight">{t('pvpTitle')}</h2>
-                  <p className="text-gray-500 max-w-sm mb-8 text-sm leading-relaxed">{t('pvpDesc')}</p>
-                  <div className="inline-flex items-center gap-3 bg-emerald-500 text-white px-8 py-4 rounded-2xl font-semibold text-sm shadow-md group-hover:bg-emerald-600 transition-colors">
-                    {t('startMatch')} <Play size={18} fill="currentColor" />
+              {/* Ranked PvP — big card (shows rejoin if active game exists) */}
+              {rejoinGame ? (
+                <div className="relative bg-white/80 p-10 rounded-[3rem] shadow-sm overflow-hidden border border-amber-200">
+                  <div className="relative z-10">
+                    <div className="inline-flex items-center gap-2 bg-amber-50 px-4 py-2 rounded-full text-xs font-semibold text-amber-600 mb-5 border border-amber-200 animate-pulse">
+                      ⚠️ {lang === 'ko' ? '진행 중인 대전이 있습니다' : 'You have an active game'}
+                    </div>
+                    <h2 className="text-3xl font-bold mb-2 text-gray-800 tracking-tight">
+                      {rejoinGame.player1?.username} vs {rejoinGame.player2?.username}
+                    </h2>
+                    {rejoinGame.turn === rejoinGame.myPlayerNum && (
+                      <p className="text-red-500 font-bold text-sm mb-4">
+                        ⏱ {lang === 'ko' ? `내 차례 — ${rejoinCountdown}초 안에 돌아가지 않으면 패배` : `Your turn — ${rejoinCountdown}s left before timeout`}
+                      </p>
+                    )}
+                    {rejoinGame.turn !== rejoinGame.myPlayerNum && (
+                      <p className="text-gray-400 text-sm mb-4">
+                        {lang === 'ko' ? '상대방 차례 진행 중' : "Opponent's turn in progress"}
+                      </p>
+                    )}
+                    <button
+                      onClick={() => joinPvPGame(rejoinGame.id)}
+                      className="inline-flex items-center gap-3 bg-amber-500 text-white px-8 py-4 rounded-2xl font-semibold text-sm shadow-md hover:bg-amber-600 transition-colors"
+                    >
+                      {lang === 'ko' ? '게임으로 돌아가기' : 'Rejoin Game'} <Play size={18} fill="currentColor" />
+                    </button>
                   </div>
                 </div>
-              </div>
+              ) : (
+                <div onClick={startMatchmaking} className="relative group bg-white/80 p-10 rounded-[3rem] shadow-sm cursor-pointer overflow-hidden transition-all hover:shadow-md border border-white hover:border-emerald-100">
+                  <div className="relative z-10">
+                    <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-full text-xs font-semibold text-emerald-600 mb-5 border border-emerald-100">
+                      {t('matchAvailable')}
+                    </div>
+                    <h2 className="text-4xl font-bold mb-3 text-gray-800 tracking-tight">{t('pvpTitle')}</h2>
+                    <p className="text-gray-500 max-w-sm mb-8 text-sm leading-relaxed">{t('pvpDesc')}</p>
+                    <div className="inline-flex items-center gap-3 bg-emerald-500 text-white px-8 py-4 rounded-2xl font-semibold text-sm shadow-md group-hover:bg-emerald-600 transition-colors">
+                      {t('startMatch')} <Play size={18} fill="currentColor" />
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Friend + Offline + History + Observe */}
               <div className="grid grid-cols-4 gap-4">
@@ -1914,7 +2038,7 @@ const App = () => {
       {view === 'game' && (
         <div className="relative z-10 min-h-screen flex flex-col items-center py-10">
           <header className="w-full max-w-6xl px-8 flex justify-between items-center mb-8">
-             <button onClick={() => setView('lobby')} className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
+             <button onClick={handleLeaveGame} className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
                {t('returnToLobby')}
              </button>
              <div className="text-center">
@@ -2161,6 +2285,7 @@ const App = () => {
                         }
                       }).catch(() => {});
                     }
+                    clearActiveGame();
                     setWinnerModal(null); setView('lobby'); fetchLeaderboard();
                   }}
                   className={`w-full py-5 font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg ${

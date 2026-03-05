@@ -338,57 +338,48 @@ const App = () => {
 
     // Helper to stop everything
     let unsubPool = null;
-    let pollInterval = null;
+    let recheckInterval = null;
     const stopAll = () => {
       stopped = true;
       clearInterval(timerInterval);
-      clearInterval(pollInterval);
+      clearInterval(recheckInterval);
       clearTimeout(timeoutId);
       if (unsubPool) unsubPool();
       matchmakingCleanup.current = null;
     };
 
-    // 3) Try onSnapshot for real-time detection
-    let snapshotWorking = false;
-    unsubPool = onSnapshot(poolCollectionPath, (snapshot) => {
-      if (stopped) return;
-      snapshotWorking = true;
+    // Cache latest pool snapshot for periodic re-evaluation
+    let cachedDocs = [];
 
+    const checkForMatch = (docs) => {
+      if (stopped) return;
       // Check if we've been matched by someone else
-      const myDoc = snapshot.docs.find(d => d.id === user.uid);
+      const myDoc = docs.find(d => d.id === user.uid);
       if (myDoc && myDoc.data().gameId) {
         stopAll();
         deleteDoc(poolRef).catch(() => {});
         joinPvPGame(myDoc.data().gameId);
         return;
       }
+      tryMatchOpponents(docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll);
+    };
 
-      tryMatchOpponents(snapshot.docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll);
+    // 3) onSnapshot for real-time detection of new players
+    unsubPool = onSnapshot(poolCollectionPath, (snapshot) => {
+      if (stopped) return;
+      cachedDocs = snapshot.docs;
+      checkForMatch(cachedDocs);
     }, (err) => {
-      console.warn('Pool onSnapshot failed, using polling fallback:', err);
+      console.warn('Pool onSnapshot failed:', err);
     });
 
-    // 4) Polling fallback — in case onSnapshot fails (e.g. security rules)
-    pollInterval = setInterval(async () => {
-      if (stopped || snapshotWorking) return;
-      try {
-        const snapshot = await getDocs(poolCollectionPath);
-        if (stopped) return;
-
-        // Check if we've been matched
-        const myDoc = snapshot.docs.find(d => d.id === user.uid);
-        if (myDoc && myDoc.data().gameId) {
-          stopAll();
-          deleteDoc(poolRef).catch(() => {});
-          joinPvPGame(myDoc.data().gameId);
-          return;
-        }
-
-        tryMatchOpponents(snapshot.docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll);
-      } catch (err) {
-        console.warn('Matchmaking poll error:', err);
-      }
-    }, 2500);
+    // 4) Periodic re-check: as tolerance grows, re-evaluate cached pool data every 2s
+    //    This is critical because onSnapshot only fires on doc changes,
+    //    but tolerance increases over time even without doc changes.
+    recheckInterval = setInterval(() => {
+      if (stopped || cachedDocs.length === 0) return;
+      checkForMatch(cachedDocs);
+    }, 2000);
 
     // 5) Write to pool LAST (non-blocking)
     setDoc(poolRef, {

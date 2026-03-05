@@ -25,7 +25,7 @@ import {
   runTransaction,
   arrayUnion
 } from 'firebase/firestore';
-import { Trophy, Play, Shield, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight, Gamepad2 } from 'lucide-react';
+import { Trophy, Play, Shield, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight, Gamepad2, Eye } from 'lucide-react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import { Analytics } from '@vercel/analytics/react';
 import { translations } from './translations';
@@ -49,6 +49,10 @@ const appId = import.meta.env.VITE_APP_ID || 'connect6-forest-v4';
 const BOARD_SIZE = 19;
 const MATCH_TIMEOUT = 30000;
 const TURN_TIME_LIMIT = 30; // seconds per turn
+
+const AI_BOT_UID = 'ai_bot_v1';
+const AI_BOT_DISPLAY_NAME = 'AI Bot';
+const AI_BOT_NAMES = ['AlphaStone', 'NeuralGo', 'BotPlayer', 'DeepSix', 'StoneMind', 'ZenMove', 'ProPlayer', 'NextMove'];
 
 const App = () => {
   const [user, setUser] = useState(null);
@@ -80,6 +84,14 @@ const App = () => {
   const [gameHistoryList, setGameHistoryList] = useState([]);
   const [replayGame, setReplayGame] = useState(null);
   const [replayMoveIndex, setReplayMoveIndex] = useState(0);
+
+  // Observe mode state
+  const [observeUsername, setObserveUsername] = useState('');
+  const [observeGameId, setObserveGameId] = useState(null);
+
+  // Opponent left notification
+  const [opponentLeftMsg, setOpponentLeftMsg] = useState(false);
+  const opponentLeftTimerRef = useRef(null);
 
   // Translation helper
   const t = useCallback((key) => {
@@ -176,10 +188,10 @@ const App = () => {
         const winnerUpdate = { wins: wWins, totalGames: wTotal, winRate: wRate };
         const loserUpdate = { losses: lLosses, totalGames: lTotal, winRate: lRate };
 
-        transaction.update(winnerProfileRef, winnerUpdate);
-        transaction.update(winnerLeaderRef, winnerUpdate);
-        transaction.update(loserProfileRef, loserUpdate);
-        transaction.update(loserLeaderRef, loserUpdate);
+        transaction.set(winnerProfileRef, winnerUpdate, { merge: true });
+        transaction.set(winnerLeaderRef, winnerUpdate, { merge: true });
+        transaction.set(loserProfileRef, loserUpdate, { merge: true });
+        transaction.set(loserLeaderRef, loserUpdate, { merge: true });
       });
 
       if (user?.uid === winnerUid || user?.uid === loserUid) {
@@ -235,7 +247,7 @@ const App = () => {
         setError(t('pwMismatch'));
         return;
       }
-      if (username.length < 2 || username.length > 12) {
+      if (username.length < 2 || username.length > 12 || !/^[a-zA-Z0-9_\uAC00-\uD7A3]+$/.test(username)) {
         setError(t('usernameValidation'));
         return;
       }
@@ -466,11 +478,14 @@ const App = () => {
   };
 
   const startComputerGame = () => {
-    const randomArray = new Uint32Array(1);
+    const randomArray = new Uint32Array(2);
     crypto.getRandomValues(randomArray);
     const playerIsBlack = randomArray[0] % 2 === 0;
     const humanPlayer = playerIsBlack ? 1 : 2;
     const aiPlayer = playerIsBlack ? 2 : 1;
+    const aiName = AI_BOT_NAMES[randomArray[1] % AI_BOT_NAMES.length];
+
+    ensureAiBotExists().catch(() => {});
 
     setGameMode('ai');
     setCurrentGame({
@@ -483,6 +498,7 @@ const App = () => {
       status: 'active',
       humanPlayer,
       aiPlayer,
+      aiName,
       moves: [],
     });
     setWinnerModal(null);
@@ -506,11 +522,13 @@ const App = () => {
 
   // --- Friend Match ---
   const sendFriendInvite = async () => {
-    if (!friendUsername.trim()) return;
+    const trimmed = friendUsername.trim().slice(0, 12);
+    if (!trimmed) return;
+    if (trimmed === userData?.username) { setError(t('userNotFound')); return; }
     setError('');
     try {
       const snapshot = await getDocs(collection(db, 'artifacts', appId, 'leaderboard'));
-      const target = snapshot.docs.find(d => d.data().username === friendUsername.trim());
+      const target = snapshot.docs.find(d => d.data().username === trimmed);
       if (!target) {
         setError(t('userNotFound'));
         return;
@@ -679,6 +697,41 @@ const App = () => {
     setView('replay');
   };
 
+  const ensureAiBotExists = async () => {
+    const leaderRef = doc(db, 'artifacts', appId, 'leaderboard', AI_BOT_UID);
+    const profileRef = doc(db, 'artifacts', appId, 'users', AI_BOT_UID, 'profile', 'data');
+    const leaderSnap = await getDoc(leaderRef);
+    if (!leaderSnap.exists()) {
+      const botData = { uid: AI_BOT_UID, username: AI_BOT_DISPLAY_NAME, wins: 0, losses: 0, totalGames: 0, winRate: 0, isBot: true };
+      await Promise.all([setDoc(leaderRef, botData), setDoc(profileRef, botData)]);
+    }
+  };
+
+  const handleObserveSearch = async () => {
+    if (!observeUsername.trim()) return;
+    setError('');
+    try {
+      const lbSnap = await getDocs(collection(db, 'artifacts', appId, 'leaderboard'));
+      const target = lbSnap.docs.find(d => d.data().username === observeUsername.trim());
+      if (!target) { setError(t('userNotFound')); return; }
+
+      const gamesQ = query(
+        collection(db, 'artifacts', appId, 'games'),
+        where('playerUids', 'array-contains', target.id),
+        firestoreLimit(10)
+      );
+      const gamesSnap = await getDocs(gamesQ);
+      const activeGame = gamesSnap.docs.find(d => d.data().status === 'active');
+      if (!activeGame) { setError(t('noActiveGame')); return; }
+
+      setObserveGameId(activeGame.id);
+      setView('observe');
+    } catch (err) {
+      console.error('Observe search failed:', err);
+      setError(t('userNotFound'));
+    }
+  };
+
   // User rank computation
   const userRank = useMemo(() => {
     if (!userData || !leaderboard.length) return null;
@@ -702,13 +755,38 @@ const App = () => {
     const turnTimerRef = useRef(null);
     const timeoutClaimRef = useRef(false);
     const [aiMoves, setAiMoves] = useState([]);
+    const [pendingMoveIdx, setPendingMoveIdx] = useState(null);
 
     // AI first move when AI is black
     useEffect(() => {
       if (game.mode === 'ai' && game.aiPlayer === 1 && moveCount === 0) {
-        setTimeout(() => triggerAiMove(board, 1, 0), 600);
+        const delay = Math.floor(Math.random() * 800) + 400;
+        setTimeout(() => triggerAiMove(board, 1, 0), delay);
       }
     }, []);
+
+    // AI mode: Turn timer (human has TURN_TIME_LIMIT seconds per turn)
+    useEffect(() => {
+      if (game.mode !== 'ai') return;
+      const humanPlayer = game.humanPlayer || 1;
+      turnTimerRef.current = setInterval(() => {
+        if (gameFinished) return;
+        const elapsed = (Date.now() - lastMoveAtRef.current) / 1000;
+        const remaining = Math.max(0, TURN_TIME_LIMIT - elapsed);
+        setTurnTimeLeft(Math.ceil(remaining));
+        if (remaining <= 0 && turn === humanPlayer && !timeoutClaimRef.current) {
+          timeoutClaimRef.current = true;
+          setGameFinished(true);
+          setWinnerModal({ text: t('youLose') + t('timeout'), isWinner: false });
+          if (!gameResultHandled.current) {
+            gameResultHandled.current = true;
+            updatePlayerStats(AI_BOT_UID, user.uid).catch(() => {});
+            fetchLeaderboard();
+          }
+        }
+      }, 200);
+      return () => clearInterval(turnTimerRef.current);
+    }, [game.mode, gameFinished, turn]);
 
     // PvP: Turn timer countdown
     useEffect(() => {
@@ -758,13 +836,18 @@ const App = () => {
           return;
         }
 
-        // Handle opponent left
-        if (data.leftPlayers && data.leftPlayers.length > 0 && data.status === 'finished') {
+        // Handle opponent left — show notification then auto-redirect
+        if (data.leftPlayers && data.leftPlayers.length > 0) {
           const opponentLeft = data.leftPlayers.some(uid => uid !== user.uid);
-          if (opponentLeft && winnerModal) {
-            setWinnerModal(null);
-            setView('lobby');
-            fetchLeaderboard();
+          if (opponentLeft && !opponentLeftMsg) {
+            setOpponentLeftMsg(true);
+            if (opponentLeftTimerRef.current) clearTimeout(opponentLeftTimerRef.current);
+            opponentLeftTimerRef.current = setTimeout(() => {
+              setOpponentLeftMsg(false);
+              setWinnerModal(null);
+              setView('lobby');
+              fetchLeaderboard();
+            }, 3000);
             return;
           }
         }
@@ -837,7 +920,7 @@ const App = () => {
       return false;
     };
 
-    const handleCellClick = async (idx) => {
+    const executePlaceStone = async (idx) => {
       if (board[idx] !== 0 || winnerModal || gameFinished) return;
 
       if (game.mode === 'pvp') {
@@ -911,6 +994,11 @@ const App = () => {
       if (checkWin(idx, turn, newBoard)) {
         setBoard(newBoard);
         setWinnerModal({ text: t('youWin'), isWinner: true });
+        if (!gameResultHandled.current) {
+          gameResultHandled.current = true;
+          updatePlayerStats(user.uid, AI_BOT_UID).catch(() => {});
+          fetchLeaderboard();
+        }
         return;
       }
 
@@ -921,11 +1009,32 @@ const App = () => {
         nextTurn = turn === 1 ? 2 : 1;
         nextTurnMoves = 0;
       }
+      lastMoveAtRef.current = Date.now();
+      timeoutClaimRef.current = false;
       setBoard(newBoard);
       setTurn(nextTurn);
       setTurnMoves(nextTurnMoves);
       setMoveCount(moveCountRef.current);
-      if (nextTurn === aiPlayer) setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), 600);
+      if (nextTurn === aiPlayer) {
+        const delay = Math.floor(Math.random() * 800) + 400;
+        setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), delay);
+      }
+    };
+
+    // Two-click stone placement: first click selects (pending), confirm button places
+    const handleCellClick = (idx) => {
+      if (board[idx] !== 0 || winnerModal || gameFinished) return;
+      if (game.mode === 'pvp' && !isMyTurn) return;
+      if (game.mode === 'ai' && turn !== (game.humanPlayer || 1)) return;
+      // Update pending position (first click or change selection)
+      setPendingMoveIdx(idx);
+    };
+
+    const confirmPlacement = async () => {
+      if (pendingMoveIdx === null) return;
+      const idx = pendingMoveIdx;
+      setPendingMoveIdx(null);
+      await executePlaceStone(idx);
     };
 
     // Score a candidate cell for AI placement
@@ -989,14 +1098,27 @@ const App = () => {
       const emptyIndices = currentBoard.map((c, i) => c === 0 ? i : -1).filter(i => i !== -1);
       if (emptyIndices.length === 0) return;
 
-      // Score all empty cells, pick the best (with small random tiebreak)
-      let bestScore = -1, bestIdx = emptyIndices[0];
-      for (const idx of emptyIndices) {
-        const score = scoreCell(currentBoard, idx, aiPlayer, humanPlayer) + Math.random() * 0.5;
-        if (score > bestScore) { bestScore = score; bestIdx = idx; }
+      // First move: prefer near center
+      const isFirstMove = moveCountRef.current === 0;
+      let aiIdx;
+      if (isFirstMove) {
+        const center = Math.floor(BOARD_SIZE / 2);
+        const rnd = new Uint32Array(2);
+        crypto.getRandomValues(rnd);
+        const offX = (rnd[0] % 5) - 2; // -2..+2
+        const offY = (rnd[1] % 5) - 2;
+        aiIdx = Math.max(0, Math.min(BOARD_SIZE - 1, center + offY)) * BOARD_SIZE +
+                Math.max(0, Math.min(BOARD_SIZE - 1, center + offX));
+      } else {
+        // Score all empty cells, pick the best (with small random tiebreak)
+        let bestScore = -1;
+        aiIdx = emptyIndices[0];
+        for (const idx of emptyIndices) {
+          const score = scoreCell(currentBoard, idx, aiPlayer, humanPlayer) + Math.random() * 0.5;
+          if (score > bestScore) { bestScore = score; aiIdx = idx; }
+        }
       }
 
-      const aiIdx = bestIdx;
       const newBoard = [...currentBoard];
       newBoard[aiIdx] = aiPlayer;
 
@@ -1005,21 +1127,33 @@ const App = () => {
       if (checkWin(aiIdx, aiPlayer, newBoard)) {
         setBoard(newBoard);
         setWinnerModal({ text: t('youLose'), isWinner: false });
+        // Track AI win stats
+        if (!gameResultHandled.current) {
+          gameResultHandled.current = true;
+          updatePlayerStats(AI_BOT_UID, user.uid).catch(() => {});
+          fetchLeaderboard();
+        }
         return;
       }
 
       let nextTurn = aiPlayer;
       let nextTurnMoves = currentAiTurnMoves + 1;
       moveCountRef.current++;
-      if (nextTurnMoves === 2) {
+      // First overall move only gets 1 stone; otherwise 2 per turn
+      if (moveCountRef.current === 1 || nextTurnMoves === 2) {
         nextTurn = aiPlayer === 1 ? 2 : 1;
         nextTurnMoves = 0;
       }
+      lastMoveAtRef.current = Date.now();
+      timeoutClaimRef.current = false;
       setBoard(newBoard);
       setTurn(nextTurn);
       setTurnMoves(nextTurnMoves);
       setMoveCount(moveCountRef.current);
-      if (nextTurn === aiPlayer) setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), 600);
+      if (nextTurn === aiPlayer) {
+        const delay = Math.floor(Math.random() * 800) + 400;
+        setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), delay);
+      }
     };
 
     const BOARD_PX = 600;
@@ -1040,7 +1174,7 @@ const App = () => {
              <span className="text-gray-800 font-bold text-sm">
                {game.mode === 'pvp'
                  ? (isMyTurn ? t('myTurn') : `${opponentName}${t('opponentTurnOf')}`)
-                 : (isHumanTurn ? t('myTurn') : 'AI' + t('opponentTurnOf'))}
+                 : (isHumanTurn ? t('myTurn') : `${game.aiName || 'AI'}${t('opponentTurnOf')}`)}
              </span>
              <div className="flex items-center gap-2 mt-1">
                <div className="flex gap-1">
@@ -1072,13 +1206,21 @@ const App = () => {
              </>
            )}
            {game.mode === 'ai' && (
-             <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
-               <div className={`w-3 h-3 rounded-full ${humanPlayer === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-               <span>{t('me')}</span>
-               <span className="text-gray-300">vs</span>
-               <div className={`w-3 h-3 rounded-full ${humanPlayer === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-               <span>AI</span>
-             </div>
+             <>
+               <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
+                 <div className={`w-3 h-3 rounded-full ${humanPlayer === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+                 <span>{t('me')}</span>
+                 <span className="text-gray-300">vs</span>
+                 <div className={`w-3 h-3 rounded-full ${humanPlayer === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+                 <span>{game.aiName || 'AI'}</span>
+               </div>
+               <div className="ml-4 flex items-center gap-2">
+                 <Timer size={16} className={timerTextColor} />
+                 <span className={`font-bold text-lg tabular-nums ${timerTextColor} ${turnTimeLeft <= 5 ? 'animate-pulse' : ''}`}>
+                   {turnTimeLeft}s
+                 </span>
+               </div>
+             </>
            )}
            {game.mode === 'local' && (
              <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
@@ -1091,8 +1233,8 @@ const App = () => {
            )}
         </div>
 
-        {/* Turn timer bar for PvP */}
-        {game.mode === 'pvp' && !gameFinished && (
+        {/* Turn timer bar for PvP and AI */}
+        {(game.mode === 'pvp' || game.mode === 'ai') && !gameFinished && (
           <div className="w-full max-w-[660px] mb-4 h-2 bg-gray-200 rounded-full overflow-hidden">
             <div
               className={`h-full ${timerColor} rounded-full transition-all duration-200 ease-linear`}
@@ -1150,11 +1292,114 @@ const App = () => {
                           : 'bg-gradient-to-br from-white via-gray-50 to-gray-200 shadow-[2px_3px_5px_rgba(0,0,0,0.15),inset_-1px_-1px_2px_rgba(0,0,0,0.05)] border border-gray-200'
                         }
                       `}></div>
+                    ) : pendingMoveIdx === i ? (
+                      // Pending stone preview (semi-transparent)
+                      <div className={`
+                        z-20 w-[90%] h-[90%] rounded-full opacity-60 ring-2 ring-emerald-400 ring-offset-1 transition-all duration-150
+                        ${turn === 1
+                          ? 'bg-gradient-to-br from-gray-700 via-gray-900 to-black'
+                          : 'bg-gradient-to-br from-white via-gray-50 to-gray-200 border border-gray-200'
+                        }
+                      `}></div>
                     ) : (
                       <div className={`
                         z-10 w-[35%] h-[35%] rounded-full opacity-0 group-hover/cell:opacity-30 transition-opacity
                         ${turn === 1 ? 'bg-gray-800' : 'bg-white shadow-sm'}
                       `}></div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Confirm stone placement button */}
+        {pendingMoveIdx !== null && !winnerModal && !gameFinished && (
+          <div className="mt-5 flex items-center gap-3">
+            <button
+              onClick={confirmPlacement}
+              className="px-8 py-3 bg-emerald-500 hover:bg-emerald-600 text-white font-bold rounded-2xl shadow-md transition-all transform active:scale-[0.97] text-base"
+            >
+              {t('confirmStone')}
+            </button>
+            <button
+              onClick={() => setPendingMoveIdx(null)}
+              className="px-6 py-3 bg-white/80 text-gray-500 hover:text-gray-700 font-semibold rounded-2xl border border-gray-200 transition-all text-sm"
+            >
+              {t('cancelStone')}
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // --- Observe Board Component (read-only live view) ---
+  const ObserveBoard = ({ gameId }) => {
+    const [board, setBoard] = useState(Array(BOARD_SIZE * BOARD_SIZE).fill(0));
+    const [turn, setTurn] = useState(1);
+    const [p1Name, setP1Name] = useState('');
+    const [p2Name, setP2Name] = useState('');
+    const [gameStatus, setGameStatus] = useState('active');
+
+    useEffect(() => {
+      const gameRef = doc(db, 'artifacts', appId, 'games', gameId);
+      const unsub = onSnapshot(gameRef, (snap) => {
+        if (!snap.exists()) { setGameStatus('notfound'); return; }
+        const data = snap.data();
+        setBoard(data.board || Array(BOARD_SIZE * BOARD_SIZE).fill(0));
+        setTurn(data.turn || 1);
+        setP1Name(data.player1?.username || '');
+        setP2Name(data.player2?.username || '');
+        setGameStatus(data.status || 'active');
+      });
+      return () => unsub();
+    }, [gameId]);
+
+    const BOARD_PX = 600;
+    const CELL_SIZE = BOARD_PX / (BOARD_SIZE - 1);
+
+    return (
+      <div className="flex flex-col items-center">
+        <div className="mb-4 flex items-center gap-4 bg-white/70 backdrop-blur-md px-8 py-3 rounded-3xl border border-emerald-100 shadow-sm">
+          <div className={`w-4 h-4 rounded-full shadow ${turn === 1 ? 'bg-gray-900 scale-125' : 'bg-gray-200 border border-gray-400'}`} />
+          <span className="font-bold text-gray-700 text-sm">{p1Name}</span>
+          <span className="text-gray-400">vs</span>
+          <span className="font-bold text-gray-700 text-sm">{p2Name}</span>
+          <div className={`w-4 h-4 rounded-full shadow ${turn === 2 ? 'bg-gray-900 scale-125' : 'bg-gray-200 border border-gray-400'}`} />
+          {gameStatus === 'finished' && <span className="text-red-500 text-sm font-bold ml-2">{t('gameOver')}</span>}
+          <span className="ml-2 text-xs bg-purple-100 text-purple-600 px-2 py-0.5 rounded-full font-semibold">{t('observing')}</span>
+        </div>
+
+        <div className="relative mt-2">
+          <div className="relative bg-[#e6c280] rounded-sm border-b-[8px] border-r-[8px] border-[#d4ae6a] shadow-xl">
+            <div className="relative p-[30px]" style={{ width: `${BOARD_PX + 60}px`, height: `${BOARD_PX + 60}px` }}>
+              <svg className="absolute top-[30px] left-[30px] pointer-events-none" width={BOARD_PX} height={BOARD_PX}>
+                {Array.from({ length: BOARD_SIZE }).map((_, i) => (
+                  <React.Fragment key={i}>
+                    <line x1={i * CELL_SIZE} y1="0" x2={i * CELL_SIZE} y2={BOARD_PX} stroke="rgba(0,0,0,0.4)" strokeWidth="1" />
+                    <line x1="0" y1={i * CELL_SIZE} x2={BOARD_PX} y2={i * CELL_SIZE} stroke="rgba(0,0,0,0.4)" strokeWidth="1" />
+                  </React.Fragment>
+                ))}
+                {[3, 9, 15].map(x => [3, 9, 15].map(y => (
+                  <circle key={`${x}-${y}`} cx={x * CELL_SIZE} cy={y * CELL_SIZE} r="3" fill="rgba(0,0,0,0.6)" />
+                )))}
+              </svg>
+              <div className="absolute top-[30px] left-[30px] grid" style={{
+                gridTemplateColumns: `repeat(${BOARD_SIZE}, 1fr)`,
+                gridTemplateRows: `repeat(${BOARD_SIZE}, 1fr)`,
+                width: `${BOARD_PX + CELL_SIZE}px`,
+                height: `${BOARD_PX + CELL_SIZE}px`,
+                transform: `translate(-${CELL_SIZE / 2}px, -${CELL_SIZE / 2}px)`,
+              }}>
+                {board.map((cell, i) => (
+                  <div key={i} className="relative flex items-center justify-center" style={{ width: `${CELL_SIZE}px`, height: `${CELL_SIZE}px` }}>
+                    {cell !== 0 && (
+                      <div className={`z-20 w-[90%] h-[90%] rounded-full ${cell === 1
+                        ? 'bg-gradient-to-br from-gray-700 via-gray-900 to-black shadow-[2px_3px_5px_rgba(0,0,0,0.4)]'
+                        : 'bg-gradient-to-br from-white via-gray-50 to-gray-200 shadow-[2px_3px_5px_rgba(0,0,0,0.15)] border border-gray-200'
+                      }`} />
                     )}
                   </div>
                 ))}
@@ -1434,22 +1679,27 @@ const App = () => {
                 </div>
               </div>
 
-              {/* Friend + Offline + History */}
-              <div className="grid grid-cols-3 gap-4">
-                <button onClick={() => { setFriendUsername(''); setError(''); setView('friendMatch'); }} className="p-6 bg-white/70 rounded-[2rem] border border-white hover:border-blue-200 hover:bg-white shadow-sm transition-all text-left group">
-                  <Users className="text-blue-400 mb-4 w-8 h-8 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-lg font-bold text-gray-800 tracking-tight mb-1">{t('friendMatch')}</h3>
+              {/* Friend + Offline + History + Observe */}
+              <div className="grid grid-cols-4 gap-4">
+                <button onClick={() => { setFriendUsername(''); setError(''); setView('friendMatch'); }} className="p-5 bg-white/70 rounded-[2rem] border border-white hover:border-blue-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <Users className="text-blue-400 mb-3 w-7 h-7 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-base font-bold text-gray-800 tracking-tight mb-1">{t('friendMatch')}</h3>
                   <p className="text-xs text-gray-400">{t('friendMatchDesc')}</p>
                 </button>
-                <button onClick={startLocalGame} className="p-6 bg-white/70 rounded-[2rem] border border-white hover:border-purple-200 hover:bg-white shadow-sm transition-all text-left group">
-                  <Gamepad2 className="text-purple-400 mb-4 w-8 h-8 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-lg font-bold text-gray-800 tracking-tight mb-1">{t('offlineMatch')}</h3>
+                <button onClick={startLocalGame} className="p-5 bg-white/70 rounded-[2rem] border border-white hover:border-purple-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <Gamepad2 className="text-purple-400 mb-3 w-7 h-7 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-base font-bold text-gray-800 tracking-tight mb-1">{t('offlineMatch')}</h3>
                   <p className="text-xs text-gray-400">{t('offlineMatchDesc')}</p>
                 </button>
-                <button onClick={() => { fetchGameHistory(); setView('history'); }} className="p-6 bg-white/70 rounded-[2rem] border border-white hover:border-amber-200 hover:bg-white shadow-sm transition-all text-left group">
-                  <History className="text-amber-400 mb-4 w-8 h-8 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-lg font-bold text-gray-800 tracking-tight mb-1">{t('gameHistory')}</h3>
+                <button onClick={() => { fetchGameHistory(); setView('history'); }} className="p-5 bg-white/70 rounded-[2rem] border border-white hover:border-amber-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <History className="text-amber-400 mb-3 w-7 h-7 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-base font-bold text-gray-800 tracking-tight mb-1">{t('gameHistory')}</h3>
                   <p className="text-xs text-gray-400">{t('gameHistoryDesc')}</p>
+                </button>
+                <button onClick={() => { setObserveUsername(''); setError(''); setView('observeSearch'); }} className="p-5 bg-white/70 rounded-[2rem] border border-white hover:border-indigo-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <Eye className="text-indigo-400 mb-3 w-7 h-7 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-base font-bold text-gray-800 tracking-tight mb-1">{t('observeMode')}</h3>
+                  <p className="text-xs text-gray-400">{t('observeDesc')}</p>
                 </button>
               </div>
             </div>
@@ -1514,6 +1764,55 @@ const App = () => {
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* === OBSERVE SEARCH === */}
+      {view === 'observeSearch' && (
+        <div className="relative z-10 min-h-screen flex items-center justify-center">
+          <div className="text-center bg-white/60 backdrop-blur-md p-16 rounded-[4rem] border border-white shadow-xl max-w-md w-full">
+            <div className="mb-8 inline-flex p-6 bg-indigo-50 rounded-full text-indigo-500 border border-indigo-100 shadow-sm">
+              <Eye size={48} strokeWidth={1.5} />
+            </div>
+            <h2 className="text-3xl font-bold text-gray-800 tracking-tight mb-2">{t('observeMode')}</h2>
+            <p className="text-gray-400 text-sm mb-8">{t('observeDesc')}</p>
+            {error && <p className="text-red-500 text-sm mb-4">{error}</p>}
+            <div className="space-y-4">
+              <input
+                type="text"
+                value={observeUsername}
+                onChange={(e) => setObserveUsername(e.target.value.slice(0, 12))}
+                placeholder={t('enterUsernameToObserve')}
+                className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-indigo-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm"
+                onKeyDown={(e) => e.key === 'Enter' && handleObserveSearch()}
+              />
+              <button onClick={handleObserveSearch} className="w-full py-4 bg-indigo-500 hover:bg-indigo-600 rounded-xl font-semibold text-white transition-all shadow-md transform active:scale-[0.98] text-base">
+                {t('startObserve')}
+              </button>
+              <button onClick={() => { setError(''); setView('lobby'); }} className="w-full py-3 bg-gray-100 text-gray-600 hover:bg-gray-200 rounded-xl text-sm font-semibold transition-all">
+                {t('cancelSearch')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* === OBSERVE GAME === */}
+      {view === 'observe' && observeGameId && (
+        <div className="relative z-10 min-h-screen flex flex-col items-center py-10">
+          <header className="w-full max-w-6xl px-8 flex justify-between items-center mb-8">
+            <button onClick={() => setView('lobby')} className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
+              {t('observeBack')}
+            </button>
+            <div className="text-center">
+              <div className="text-xs font-semibold text-indigo-500 mb-1">{t('observing')}</div>
+              <div className="text-2xl font-bold tracking-tight text-gray-800">{t('observeMode')}</div>
+            </div>
+            <div className="w-[130px]"></div>
+          </header>
+          <div className="flex-1 flex items-center justify-center w-full">
+            <ObserveBoard gameId={observeGameId} />
           </div>
         </div>
       )}
@@ -1746,6 +2045,17 @@ const App = () => {
           </header>
           <div className="flex-1 flex items-center justify-center w-full">
             <ReplayBoard game={replayGame} />
+          </div>
+        </div>
+      )}
+
+      {/* === OPPONENT LEFT NOTIFICATION === */}
+      {opponentLeftMsg && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-gray-900/50 backdrop-blur-sm">
+          <div className="bg-white rounded-3xl p-10 text-center shadow-2xl border border-gray-100 max-w-sm w-full mx-6">
+            <div className="mb-4 text-4xl">🚪</div>
+            <p className="text-xl font-bold text-gray-800 mb-2">{t('opponentLeftTitle')}</p>
+            <p className="text-gray-500 text-sm">{t('opponentLeftMsg')}</p>
           </div>
         </div>
       )}

@@ -128,6 +128,24 @@ export const translations = {
     rematchAccept: '상대방이 재대결을 원합니다! 수락하기',
     rematchRequest: '재대결 (색 교대)',
 
+    // Observe mode
+    observeMode: '관전',
+    observeDesc: '실시간 대전 관전',
+    enterUsernameToObserve: '관전할 플레이어 닉네임',
+    startObserve: '관전하기',
+    noActiveGame: '진행 중인 대전이 없습니다',
+    observing: '관전 중',
+    observeBack: '로비로 돌아가기',
+    gameOver: '게임 종료',
+
+    // Stone placement confirmation
+    confirmStone: '착수',
+    cancelStone: '취소',
+
+    // Opponent left
+    opponentLeftTitle: '상대방이 나갔습니다',
+    opponentLeftMsg: '잠시 후 로비로 이동합니다...',
+
     // Language
     language: '언어',
     korean: '한국어',
@@ -262,6 +280,24 @@ export const translations = {
     rematchWaiting: 'Waiting for opponent...',
     rematchAccept: 'Opponent wants a rematch! Accept',
     rematchRequest: 'Rematch (swap colors)',
+
+    // Observe mode
+    observeMode: 'Observe',
+    observeDesc: 'Watch a live game',
+    enterUsernameToObserve: "Enter player's username",
+    startObserve: 'Watch',
+    noActiveGame: 'No active game found',
+    observing: 'Observing',
+    observeBack: 'Back to Lobby',
+    gameOver: 'Game Over',
+
+    // Stone placement confirmation
+    confirmStone: 'Place Stone',
+    cancelStone: 'Cancel',
+
+    // Opponent left
+    opponentLeftTitle: 'Opponent has left',
+    opponentLeftMsg: 'Returning to lobby...',
 
     // Language
     language: 'Language',

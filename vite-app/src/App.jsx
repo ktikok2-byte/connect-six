@@ -25,7 +25,7 @@ import {
   runTransaction,
   arrayUnion
 } from 'firebase/firestore';
-import { Trophy, Play, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight, Gamepad2 } from 'lucide-react';
+import { Trophy, Play, Shield, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight, Gamepad2 } from 'lucide-react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import { Analytics } from '@vercel/analytics/react';
 import { translations } from './translations';

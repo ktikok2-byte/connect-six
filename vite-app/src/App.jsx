@@ -412,7 +412,11 @@ const App = () => {
       p1 = forceOrder.player1;
       p2 = forceOrder.player2;
     } else {
-      const meFirst = Math.random() < 0.5;
+      // Use crypto for true randomness
+      const randomArray = new Uint32Array(1);
+      crypto.getRandomValues(randomArray);
+      const meFirst = randomArray[0] % 2 === 0;
+      console.log('[Color Assignment] Random value:', randomArray[0], '→ meFirst:', meFirst);
       p1 = meFirst
         ? { uid: user.uid, username: userData?.username }
         : { uid: opponentData.uid, username: opponentData.username };

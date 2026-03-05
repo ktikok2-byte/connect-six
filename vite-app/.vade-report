@@ -1,52 +1,38 @@
-# Vercel Speed Insights Implementation
+# Vercel Web Analytics Integration
 
-Successfully implemented Vercel Speed Insights for the Connect Six game application.
+Successfully integrated Vercel Web Analytics into the Connect Six React application.
 
 ## Changes Made
 
 ### 1. Installed Dependencies
-- Added `@vercel/speed-insights` package to the project
-- Package version installed: Latest version available via npm
+- Added `@vercel/analytics@^1.6.1` package to project dependencies
 
 ### 2. Modified Files
+- **src/App.jsx**: 
+  - Added import for `Analytics` component from `@vercel/analytics/react`
+  - Added `<Analytics />` component at the end of the main return statement, right after the existing `<SpeedInsights />` component
 
-**src/App.jsx**
-- Added import statement: `import { SpeedInsights } from '@vercel/speed-insights/react';`
-- Added `<SpeedInsights />` component at the end of the main App component's return statement
-- The component is placed just before the closing div tag to ensure it tracks all page interactions
-
-**package.json & package-lock.json**
-- Updated to include the new `@vercel/speed-insights` dependency
+### 3. Updated Lock Files
+- **package-lock.json**: Updated with new dependency tree for @vercel/analytics
 
 ## Implementation Details
 
-This is a React application built with Vite. Following the Vercel Speed Insights documentation for React applications, I implemented the Speed Insights tracking by:
+Following the Vercel Web Analytics documentation for React applications (create-react-app style), the `Analytics` component was integrated into the main App component. This component:
+- Provides seamless integration with React
+- Automatically tracks page views and visitor metrics
+- Works alongside the existing SpeedInsights integration
 
-1. Using the React-specific package (`@vercel/speed-insights/react`)
-2. Adding the `<SpeedInsights />` component to the main App component
-3. Placing it at the root level to track all routes and interactions
+The Analytics component is placed at the end of the component tree to ensure it loads after the main application content and doesn't block rendering.
 
-The component is a wrapper around the tracking script that provides seamless integration with React applications and will automatically:
-- Track Core Web Vitals (CWV) metrics
-- Monitor page performance
-- Send data to Vercel's Speed Insights dashboard once deployed
+## Verification
 
-## Testing & Verification
-
-✅ Build completed successfully (`npm run build`)
-✅ No new linting errors introduced by these changes
-✅ Application structure preserved
-✅ Lock files updated correctly
+- ✅ Build completed successfully (npm run build)
+- ✅ No new linting errors introduced (existing linting errors are pre-existing and unrelated to this change)
+- ✅ Package dependencies properly updated
 
 ## Next Steps
 
-After deployment to Vercel:
-1. Enable Speed Insights in the Vercel dashboard (Project → Speed Insights → Enable)
-2. The `/_vercel/speed-insights/script.js` route will be automatically added
-3. Performance metrics will start appearing in the Speed Insights dashboard after users visit the site
-
-## Notes
-
-- The implementation follows Vercel's recommended pattern for React applications
-- Pre-existing linting warnings in the codebase were not addressed as they are unrelated to this implementation
-- The SpeedInsights component requires no additional configuration for basic usage
+Once deployed to Vercel:
+1. Enable Web Analytics in the Vercel dashboard (Analytics tab)
+2. After deployment, verify that `/_vercel/insights/view` requests appear in browser Network tab
+3. View analytics data in the Vercel dashboard after users visit the site

@@ -51,7 +51,7 @@ const MATCH_TIMEOUT = 30000;
 const TURN_TIME_LIMIT = 30; // seconds per turn
 
 const AI_BOT_UID = 'ai_bot_v1';
-const AI_BOT_DISPLAY_NAME = 'Player_' + AI_BOT_UID.slice(0, 4); // = 'Player_ai_b'
+const AI_BOT_DISPLAY_NAME = 'Player_x7k2';
 
 const App = () => {
   const [user, setUser] = useState(null);
@@ -115,6 +115,7 @@ const App = () => {
       setUser(u);
       if (u) {
         await fetchUserData(u.uid);
+        ensureAiBotExists().catch(() => {});
         fetchLeaderboard();
         setView('lobby');
       } else {
@@ -164,7 +165,7 @@ const App = () => {
     }
   };
 
-  const updatePlayerStats = async (winnerUid, loserUid) => {
+  const updatePlayerStats = async (winnerUid, loserUid, gameId) => {
     if (gameResultHandled.current) return;
     gameResultHandled.current = true;
     try {
@@ -172,8 +173,15 @@ const App = () => {
       const winnerLeaderRef = doc(db, 'artifacts', appId, 'leaderboard', winnerUid);
       const loserProfileRef = doc(db, 'artifacts', appId, 'users', loserUid, 'profile', 'data');
       const loserLeaderRef = doc(db, 'artifacts', appId, 'leaderboard', loserUid);
+      const gameRef = gameId ? doc(db, 'artifacts', appId, 'games', gameId) : null;
 
       await runTransaction(db, async (transaction) => {
+        // Check statsRecorded flag to prevent double-counting from both clients
+        if (gameRef) {
+          const gameSnap = await transaction.get(gameRef);
+          if (gameSnap.exists() && gameSnap.data().statsRecorded) return;
+        }
+
         const winnerSnap = await transaction.get(winnerProfileRef);
         const loserSnap = await transaction.get(loserProfileRef);
         const wData = winnerSnap.exists() ? winnerSnap.data() : { wins: 0, losses: 0, totalGames: 0 };
@@ -195,11 +203,14 @@ const App = () => {
         transaction.set(winnerLeaderRef, winnerUpdate, { merge: true });
         transaction.set(loserProfileRef, loserUpdate, { merge: true });
         transaction.set(loserLeaderRef, loserUpdate, { merge: true });
+        // Mark stats as recorded so the other client skips this
+        if (gameRef) transaction.set(gameRef, { statsRecorded: true }, { merge: true });
       });
 
       if (user?.uid === winnerUid || user?.uid === loserUid) {
         fetchUserData(user.uid);
       }
+      fetchLeaderboard();
     } catch (err) {
       console.error('Stats update failed:', err);
     }
@@ -467,6 +478,7 @@ const App = () => {
       rematchGameId: null,
       friendMatch: isFriendMatch,
       moves: [],
+      statsRecorded: false,
       createdAt: serverTimestamp()
     });
     return gameRef.id;
@@ -477,6 +489,7 @@ const App = () => {
     // Store active game ID in user profile for rejoin detection
     if (user) {
       updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { activeGameId: gameId }).catch(() => {});
+      setUserData(prev => prev ? { ...prev, activeGameId: gameId } : prev);
     }
     setRejoinGame(null);
     setGameMode('pvp');
@@ -488,6 +501,7 @@ const App = () => {
   const clearActiveGame = () => {
     if (user) {
       updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { activeGameId: null }).catch(() => {});
+      setUserData(prev => prev ? { ...prev, activeGameId: null } : prev);
     }
   };
 
@@ -646,6 +660,7 @@ const App = () => {
         rematchGameId: null,
         friendMatch: true,
         moves: [],
+        statsRecorded: false,
         createdAt: serverTimestamp()
       });
 
@@ -985,9 +1000,9 @@ const App = () => {
             friendMatch: data.friendMatch || false,
           });
 
-          // Only update stats for ranked matches
-          if (iWon && winnerUid && loserUid && !data.friendMatch) {
-            updatePlayerStats(winnerUid, loserUid);
+          // Both winner and loser clients attempt stats update; statsRecorded flag prevents double-counting
+          if (winnerUid && loserUid && !data.friendMatch) {
+            updatePlayerStats(winnerUid, loserUid, game.id);
           }
         }
       });

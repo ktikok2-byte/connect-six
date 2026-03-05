@@ -404,11 +404,25 @@ const App = () => {
     };
   };
 
-  const createPvPGame = async (opponentData) => {
+  const createPvPGame = async (opponentData, forceOrder) => {
     const gameRef = doc(collection(db, 'artifacts', appId, 'games'));
+    // Random color assignment unless forced order is specified (rematch)
+    let p1, p2;
+    if (forceOrder) {
+      p1 = forceOrder.player1;
+      p2 = forceOrder.player2;
+    } else {
+      const meFirst = Math.random() < 0.5;
+      p1 = meFirst
+        ? { uid: user.uid, username: userData?.username }
+        : { uid: opponentData.uid, username: opponentData.username };
+      p2 = meFirst
+        ? { uid: opponentData.uid, username: opponentData.username }
+        : { uid: user.uid, username: userData?.username };
+    }
     await setDoc(gameRef, {
-      player1: { uid: user.uid, username: userData?.username },
-      player2: { uid: opponentData.uid, username: opponentData.username },
+      player1: p1,
+      player2: p2,
       board: Array(BOARD_SIZE * BOARD_SIZE).fill(0),
       turn: 1,
       moveCount: 0,
@@ -416,8 +430,10 @@ const App = () => {
       status: 'active',
       winner: null,
       loser: null,
-      winReason: null, // 'connect6' | 'timeout'
+      winReason: null,
       lastMoveAt: Date.now(),
+      rematchRequests: [],
+      rematchGameId: null,
       createdAt: serverTimestamp()
     });
     return gameRef.id;
@@ -510,6 +526,12 @@ const App = () => {
         setIsMyTurn(data.turn === pNum && data.status === 'active');
         setOpponentName(pNum === 1 ? data.player2.username : data.player1.username);
 
+        // Handle rematch: if a new game was created, join it
+        if (data.rematchGameId && data.status === 'finished') {
+          joinPvPGame(data.rematchGameId);
+          return;
+        }
+
         if (data.status === 'finished') {
           setGameFinished(true);
           clearInterval(turnTimerRef.current);
@@ -517,12 +539,10 @@ const App = () => {
           // Determine winner/loser UIDs
           let winnerUid, loserUid, winnerName;
           if (data.winReason === 'timeout') {
-            // timeout: winner field is 'player1' or 'player2' reference
             winnerUid = data.winner === 'player1' ? data.player1.uid : data.player2.uid;
             loserUid = data.loser;
             winnerName = data.winner === 'player1' ? data.player1.username : data.player2.username;
           } else {
-            // connect6 win: winner field is the UID directly
             winnerUid = data.winner;
             loserUid = winnerUid === data.player1.uid ? data.player2.uid : data.player1.uid;
             winnerName = winnerUid === data.player1.uid ? data.player1.username : data.player2.username;
@@ -530,12 +550,20 @@ const App = () => {
 
           const iWon = winnerUid === user.uid;
           const reasonText = data.winReason === 'timeout' ? ' (시간 초과)' : '';
+          const rematchRequests = data.rematchRequests || [];
+          const iRequestedRematch = rematchRequests.includes(user.uid);
+          const opponentRequestedRematch = rematchRequests.some(uid => uid !== user.uid);
 
-          if (iWon) {
-            setWinnerModal({ text: '나의 승리!' + reasonText, isWinner: true });
-          } else {
-            setWinnerModal({ text: `${winnerName} 승리${reasonText}`, isWinner: false });
-          }
+          setWinnerModal({
+            text: iWon ? '나의 승리!' + reasonText : `${winnerName} 승리${reasonText}`,
+            isWinner: iWon,
+            gameId: game.id,
+            isPvP: true,
+            player1: data.player1,
+            player2: data.player2,
+            iRequestedRematch,
+            opponentRequestedRematch,
+          });
 
           // Only the winner updates stats (prevents double-counting)
           if (iWon && winnerUid && loserUid) {
@@ -1006,6 +1034,42 @@ const App = () => {
       {winnerModal && (() => {
         const isWin = typeof winnerModal === 'object' ? winnerModal.isWinner : true;
         const modalText = typeof winnerModal === 'object' ? winnerModal.text : winnerModal;
+        const isPvP = typeof winnerModal === 'object' && winnerModal.isPvP;
+        const iRequestedRematch = typeof winnerModal === 'object' && winnerModal.iRequestedRematch;
+        const opponentRequestedRematch = typeof winnerModal === 'object' && winnerModal.opponentRequestedRematch;
+
+        const handleRematchRequest = async () => {
+          if (!isPvP || iRequestedRematch) return;
+          const gameRef = doc(db, 'artifacts', appId, 'games', winnerModal.gameId);
+          try {
+            const gameSnap = await getDoc(gameRef);
+            if (!gameSnap.exists()) return;
+            const data = gameSnap.data();
+            const requests = data.rematchRequests || [];
+            if (requests.includes(user.uid)) return;
+            const newRequests = [...requests, user.uid];
+
+            if (newRequests.length >= 2) {
+              // Both requested: create new game with swapped colors
+              const oldP1 = data.player1;
+              const oldP2 = data.player2;
+              const newGameId = await createPvPGame(null, {
+                player1: oldP2,
+                player2: oldP1
+              });
+              await updateDoc(gameRef, {
+                rematchRequests: newRequests,
+                rematchGameId: newGameId
+              });
+            } else {
+              await updateDoc(gameRef, { rematchRequests: newRequests });
+              setWinnerModal(prev => ({ ...prev, iRequestedRematch: true }));
+            }
+          } catch (err) {
+            console.error('Rematch request failed:', err);
+          }
+        };
+
         return (
           <div className={`fixed inset-0 z-[100] backdrop-blur-md flex items-center justify-center p-6 ${isWin ? 'bg-white/60' : 'bg-gray-900/40'}`}>
             <div className={`p-16 rounded-[4rem] shadow-2xl text-center max-w-lg w-full relative overflow-hidden ${
@@ -1025,7 +1089,7 @@ const App = () => {
               <h2 className={`text-4xl font-bold mb-4 tracking-tight ${isWin ? 'text-gray-800' : 'text-gray-700'}`}>
                 {isWin ? '위대한 승리' : '아쉬운 패배'}
               </h2>
-              <p className={`font-medium mb-12 text-lg leading-relaxed ${isWin ? 'text-gray-600' : 'text-gray-500'}`}>
+              <p className={`font-medium mb-8 text-lg leading-relaxed ${isWin ? 'text-gray-600' : 'text-gray-500'}`}>
                 <span className={`block text-2xl mb-2 font-bold ${isWin ? 'text-emerald-600' : 'text-red-500'}`}>
                   {modalText}
                 </span>
@@ -1033,16 +1097,40 @@ const App = () => {
                   ? '숲의 가장 깊은 곳을 정복했습니다.'
                   : '다음에는 더 강해져서 돌아오세요.'}
               </p>
-              <button
-                onClick={() => { setWinnerModal(null); setView('lobby'); fetchLeaderboard(); }}
-                className={`w-full py-5 font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg ${
-                  isWin
-                    ? 'bg-emerald-500 hover:bg-emerald-600 text-white'
-                    : 'bg-gray-700 hover:bg-gray-800 text-white'
-                }`}
-              >
-                로비로 귀환
-              </button>
+              <div className="space-y-3">
+                {isPvP && (
+                  <button
+                    onClick={handleRematchRequest}
+                    disabled={iRequestedRematch}
+                    className={`w-full py-5 font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg ${
+                      iRequestedRematch
+                        ? 'bg-amber-100 text-amber-700 cursor-default'
+                        : opponentRequestedRematch
+                          ? 'bg-amber-500 hover:bg-amber-600 text-white animate-pulse'
+                          : 'bg-blue-500 hover:bg-blue-600 text-white'
+                    }`}
+                  >
+                    <div className="flex items-center justify-center gap-2">
+                      <RefreshCw size={20} />
+                      {iRequestedRematch
+                        ? '상대방 수락 대기 중...'
+                        : opponentRequestedRematch
+                          ? '상대방이 재대결을 원합니다! 수락하기'
+                          : '재대결 (색 교대)'}
+                    </div>
+                  </button>
+                )}
+                <button
+                  onClick={() => { setWinnerModal(null); setView('lobby'); fetchLeaderboard(); }}
+                  className={`w-full py-5 font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg ${
+                    isWin
+                      ? 'bg-emerald-500 hover:bg-emerald-600 text-white'
+                      : 'bg-gray-700 hover:bg-gray-800 text-white'
+                  }`}
+                >
+                  로비로 귀환
+                </button>
+              </div>
             </div>
           </div>
         );

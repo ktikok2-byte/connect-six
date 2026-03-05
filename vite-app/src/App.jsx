@@ -532,6 +532,17 @@ const App = () => {
           return;
         }
 
+        // If opponent left after game ended, auto-return to lobby
+        if (data.status === 'finished' && data.leftPlayers && data.leftPlayers.length > 0) {
+          const opponentLeft = data.leftPlayers.some(uid => uid !== user.uid);
+          if (opponentLeft) {
+            setWinnerModal(null);
+            setView('lobby');
+            fetchLeaderboard();
+            return;
+          }
+        }
+
         if (data.status === 'finished') {
           setGameFinished(true);
           clearInterval(turnTimerRef.current);
@@ -1121,7 +1132,21 @@ const App = () => {
                   </button>
                 )}
                 <button
-                  onClick={() => { setWinnerModal(null); setView('lobby'); fetchLeaderboard(); }}
+                  onClick={() => {
+                    // Notify opponent that we left
+                    if (isPvP && winnerModal.gameId) {
+                      const gameRef = doc(db, 'artifacts', appId, 'games', winnerModal.gameId);
+                      getDoc(gameRef).then(snap => {
+                        if (snap.exists()) {
+                          const left = snap.data().leftPlayers || [];
+                          if (!left.includes(user.uid)) {
+                            updateDoc(gameRef, { leftPlayers: [...left, user.uid] }).catch(() => {});
+                          }
+                        }
+                      }).catch(() => {});
+                    }
+                    setWinnerModal(null); setView('lobby'); fetchLeaderboard();
+                  }}
                   className={`w-full py-5 font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg ${
                     isWin
                       ? 'bg-emerald-500 hover:bg-emerald-600 text-white'

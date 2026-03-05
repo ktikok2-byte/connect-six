@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAnalytics } from "firebase/analytics";
 import {
@@ -19,13 +19,16 @@ import {
   collection,
   query,
   orderBy,
+  where,
   limit as firestoreLimit,
   serverTimestamp,
-  runTransaction
+  runTransaction,
+  arrayUnion
 } from 'firebase/firestore';
-import { Trophy, Play, Cpu, Shield, LogOut, RefreshCw, TreePine, Clock, UserPlus, Copy, Check, XCircle, Timer } from 'lucide-react';
+import { Trophy, Play, Cpu, Shield, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight } from 'lucide-react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import { Analytics } from '@vercel/analytics/react';
+import { translations } from './translations';
 
 // --- Firebase Configuration from Environment Variables ---
 const firebaseConfig = {
@@ -49,55 +52,86 @@ const TURN_TIME_LIMIT = 30; // seconds per turn
 
 const App = () => {
   const [user, setUser] = useState(null);
-  const [view, setView] = useState('login');
   const [userData, setUserData] = useState(null);
+  const [view, setView] = useState('login');
+  const [loginMode, setLoginMode] = useState('login');
+  const [autoCredentials, setAutoCredentials] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [currentGame, setCurrentGame] = useState(null);
+  const [winnerModal, setWinnerModal] = useState(null);
   const [matchmakingStatus, setMatchmakingStatus] = useState("");
   const [elapsedTime, setElapsedTime] = useState(0);
-  const [error, setError] = useState("");
-  const [winnerModal, setWinnerModal] = useState(null);
-  const [loginMode, setLoginMode] = useState('login'); // 'login' | 'register'
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [autoCredentials, setAutoCredentials] = useState(null); // { id, pw }
-  const [copied, setCopied] = useState(false);
   const [leaderboard, setLeaderboard] = useState([]);
-  const [gameMode, setGameMode] = useState(null); // 'ai' | 'pvp'
-  const [playerNumber, setPlayerNumber] = useState(0); // 1 or 2
+  const [gameMode, setGameMode] = useState(null);
+  const [playerNumber, setPlayerNumber] = useState(0);
   const matchmakingCleanup = useRef(null);
-  const gameResultHandled = useRef(false); // prevent double stats update
+  const gameResultHandled = useRef(false);
+  const pendingUsername = useRef(null);
+  const [lang, setLang] = useState('ko');
+
+  // Friend match state
+  const [friendUsername, setFriendUsername] = useState('');
+  const [pendingInvite, setPendingInvite] = useState(null);
+  const [friendInviteId, setFriendInviteId] = useState(null);
+
+  // Game history state
+  const [gameHistoryList, setGameHistoryList] = useState([]);
+  const [replayGame, setReplayGame] = useState(null);
+  const [replayMoveIndex, setReplayMoveIndex] = useState(0);
+
+  // Translation helper
+  const t = useCallback((key) => {
+    return translations[lang]?.[key] || translations['ko']?.[key] || key;
+  }, [lang]);
+
+  const handleLangChange = async (newLang) => {
+    setLang(newLang);
+    if (user) {
+      try {
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { lang: newLang });
+      } catch (e) { /* ignore */ }
+    }
+  };
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
+    const unsub = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-        fetchUserData(u.uid);
+        await fetchUserData(u.uid);
+        fetchLeaderboard();
         setView('lobby');
       } else {
+        setUserData(null);
         setView('login');
       }
     });
-    return () => unsubscribe();
+    return () => unsub();
   }, []);
 
   const fetchUserData = async (uid) => {
-    const userDoc = await getDoc(doc(db, 'artifacts', appId, 'users', uid, 'profile', 'data'));
+    const userRef = doc(db, 'artifacts', appId, 'users', uid, 'profile', 'data');
+    const userDoc = await getDoc(userRef);
     if (userDoc.exists()) {
       setUserData(userDoc.data());
+      if (userDoc.data().lang) setLang(userDoc.data().lang);
     } else {
+      const chosenUsername = pendingUsername.current;
+      pendingUsername.current = null;
       const newData = {
         uid,
-        username: "숲의여행자_" + uid.slice(0, 4),
+        username: chosenUsername || "Player_" + uid.slice(0, 4),
         wins: 0,
         losses: 0,
         totalGames: 0,
         winRate: 0,
+        lang: lang,
       };
       await setDoc(doc(db, 'artifacts', appId, 'users', uid, 'profile', 'data'), newData);
-      // Also write to flat leaderboard collection for ranking queries
       await setDoc(doc(db, 'artifacts', appId, 'leaderboard', uid), newData);
       setUserData(newData);
     }
-    fetchLeaderboard();
   };
 
   const fetchLeaderboard = async () => {
@@ -119,7 +153,6 @@ const App = () => {
     if (gameResultHandled.current) return;
     gameResultHandled.current = true;
     try {
-      // Use transaction to atomically update winner stats
       const winnerProfileRef = doc(db, 'artifacts', appId, 'users', winnerUid, 'profile', 'data');
       const winnerLeaderRef = doc(db, 'artifacts', appId, 'leaderboard', winnerUid);
       const loserProfileRef = doc(db, 'artifacts', appId, 'users', loserUid, 'profile', 'data');
@@ -138,7 +171,7 @@ const App = () => {
         const lLosses = (lData.losses || 0) + 1;
         const lTotal = (lData.totalGames || 0) + 1;
         const lWins = lData.wins || 0;
-        const lRate = lTotal > 0 ? Math.round((lWins / lTotal) * 100) : 0;
+        const lRate = Math.round((lWins / lTotal) * 100);
 
         const winnerUpdate = { wins: wWins, totalGames: wTotal, winRate: wRate };
         const loserUpdate = { losses: lLosses, totalGames: lTotal, winRate: lRate };
@@ -149,7 +182,6 @@ const App = () => {
         transaction.update(loserLeaderRef, loserUpdate);
       });
 
-      // Refresh local userData if current user was involved
       if (user?.uid === winnerUid || user?.uid === loserUid) {
         fetchUserData(user.uid);
       }
@@ -159,26 +191,23 @@ const App = () => {
   };
 
   const handleAutoRegister = async () => {
-    if (isSubmitting) return;
     setIsSubmitting(true);
     setError("");
-    const generateSecureString = (length) => {
-      const array = new Uint8Array(length);
-      window.crypto.getRandomValues(array);
-      return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('').slice(0, length);
-    };
-
-    const id = `forest_${generateSecureString(6)}`;
-    const pw = generateSecureString(12);
-
     try {
+      const generateSecureString = (length) => {
+        const array = new Uint8Array(length);
+        window.crypto.getRandomValues(array);
+        return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('').slice(0, length);
+      };
+      const id = `player_${generateSecureString(6)}`;
+      const pw = generateSecureString(12);
       const email = `${id}@forest6.com`;
       await createUserWithEmailAndPassword(auth, email, pw);
       await auth.signOut();
       setAutoCredentials({ id, pw });
       setLoginMode('credentials');
     } catch (err) {
-      setError("가입 실패: " + err.message);
+      setError(err.code === 'auth/email-already-in-use' ? t('idInUse') : t('regFailed') + err.message);
     } finally {
       setIsSubmitting(false);
     }
@@ -186,40 +215,44 @@ const App = () => {
 
   const handleManualRegister = async (e) => {
     e.preventDefault();
-    if (isSubmitting) return;
-    setError("");
-
-    const id = e.target.regId.value.trim();
-    const pw = e.target.regPw.value;
-    const pwConfirm = e.target.regPwConfirm.value;
-
-    // ID validation: alphanumeric and underscores only, 3-20 chars
-    if (!/^[a-zA-Z0-9_]{3,20}$/.test(id)) {
-      setError("아이디는 영문, 숫자, 밑줄(_)만 사용 가능하며 3~20자여야 합니다.");
-      return;
-    }
-
-    // Password strength: minimum 8 chars
-    if (pw.length < 8) {
-      setError("비밀번호는 최소 8자 이상이어야 합니다.");
-      return;
-    }
-
-    if (pw !== pwConfirm) {
-      setError("비밀번호가 일치하지 않습니다.");
-      return;
-    }
-
     setIsSubmitting(true);
+    setError("");
     try {
+      const id = e.target.regId.value.trim();
+      const pw = e.target.regPw.value;
+      const pwConfirm = e.target.regPwConfirm.value;
+      const username = e.target.regUsername.value.trim();
+
+      if (!/^[a-zA-Z0-9_]{3,20}$/.test(id)) {
+        setError(t('idValidation'));
+        return;
+      }
+      if (pw.length < 8) {
+        setError(t('pwMinLength'));
+        return;
+      }
+      if (pw !== pwConfirm) {
+        setError(t('pwMismatch'));
+        return;
+      }
+      if (username.length < 2 || username.length > 12) {
+        setError(t('usernameValidation'));
+        return;
+      }
+
+      // Check username uniqueness
+      const leaderboardSnap = await getDocs(collection(db, 'artifacts', appId, 'leaderboard'));
+      const usernameTaken = leaderboardSnap.docs.some(d => d.data().username === username);
+      if (usernameTaken) {
+        setError(t('usernameInUse'));
+        return;
+      }
+
+      pendingUsername.current = username;
       const email = `${id}@forest6.com`;
       await createUserWithEmailAndPassword(auth, email, pw);
     } catch (err) {
-      if (err.code === 'auth/email-already-in-use') {
-        setError("이미 사용 중인 아이디입니다.");
-      } else {
-        setError("가입 실패: " + err.message);
-      }
+      setError(err.code === 'auth/email-already-in-use' ? t('idInUse') : t('regFailed') + err.message);
     } finally {
       setIsSubmitting(false);
     }
@@ -227,52 +260,38 @@ const App = () => {
 
   const handleManualLogin = async (e) => {
     e.preventDefault();
-    if (isSubmitting) return;
     setIsSubmitting(true);
     setError("");
-    const email = e.target.id.value.trim() + "@forest6.com";
-    const pw = e.target.pw.value;
     try {
+      const email = e.target.id.value.trim() + "@forest6.com";
+      const pw = e.target.pw.value;
       await signInWithEmailAndPassword(auth, email, pw);
     } catch (err) {
-      setError("로그인 실패. 아이디나 비밀번호를 확인하세요.");
+      setError(t('loginFailed'));
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const cancelMatchmaking = useCallback(() => {
-    if (matchmakingCleanup.current) {
-      matchmakingCleanup.current();
-      matchmakingCleanup.current = null;
-    }
-    setView('lobby');
-  }, []);
-
-  // Calculate tolerance from elapsed seconds: +10% every 2 seconds, max 100%
+  // Matchmaking
   const calcTolerance = (elapsedSec) => Math.min(Math.floor(elapsedSec / 2) * 10, 100);
 
-  // Core matching logic — shared by both onSnapshot and polling fallback
   const tryMatchOpponents = (docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll) => {
     const now = Date.now();
     const myElapsed = Math.floor((now - startTime) / 1000);
     const myTolerance = calcTolerance(myElapsed);
 
     const allOpponents = docs.filter(d => d.id !== user.uid && !d.data().gameId);
-
-    // Filter: match if EITHER player's tolerance covers the win-rate difference
     const winRateDiff = (oppData) => Math.abs((oppData.winRate || 0) - myWinRate);
     const matchable = allOpponents.filter(d => {
       const diff = winRateDiff(d.data());
       const oppElapsed = d.data().enteredAt ? Math.floor((now - d.data().enteredAt) / 1000) : 0;
       const oppTolerance = calcTolerance(oppElapsed);
-      // Match if EITHER player's tolerance is wide enough
       return diff <= Math.max(myTolerance, oppTolerance);
     });
 
     if (matchable.length === 0) return false;
 
-    // Tiered search: sort by closest totalGames count
     matchable.sort((a, b) => {
       const aDiff = Math.abs((a.data().totalGames || 0) - myTotalGames);
       const bDiff = Math.abs((b.data().totalGames || 0) - myTotalGames);
@@ -281,7 +300,6 @@ const App = () => {
 
     const opponent = matchable[0];
 
-    // Only the player with the smaller UID creates the game (avoid duplicates)
     if (user.uid < opponent.id) {
       stopAll();
       createPvPGame(opponent.data()).then((gameId) => {
@@ -299,14 +317,14 @@ const App = () => {
       });
       return true;
     } else {
-      setMatchmakingStatus("상대를 발견! 연결 중...");
+      setMatchmakingStatus(t('opponentFound'));
       return false;
     }
   };
 
   const startMatchmaking = () => {
     setView('matchmaking');
-    setMatchmakingStatus("숲 속에서 대전 상대를 찾는 중... (허용 승률차: 0%)");
+    setMatchmakingStatus(`${t('searchingOpponent')} (${t('toleranceLabel')}: 0%)`);
     setElapsedTime(0);
     const startTime = Date.now();
     let stopped = false;
@@ -319,16 +337,14 @@ const App = () => {
     const poolCollectionPath = collection(db, 'artifacts', appId, 'matchmaking_pool');
     const poolRef = doc(poolCollectionPath, user.uid);
 
-    // 1) Start timer FIRST — completely independent of Firebase
     const timerInterval = setInterval(() => {
       if (stopped) return;
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       setElapsedTime(elapsed);
       const tolerance = calcTolerance(elapsed);
-      setMatchmakingStatus(`숲 속에서 대전 상대를 찾는 중... (허용 승률차: ${tolerance}%)`);
+      setMatchmakingStatus(`${t('searchingOpponent')} (${t('toleranceLabel')}: ${tolerance}%)`);
     }, 1000);
 
-    // 2) Timeout fallback → AI game after 30 seconds
     const timeoutId = setTimeout(() => {
       if (stopped) return;
       stopAll();
@@ -336,24 +352,25 @@ const App = () => {
       startComputerGame();
     }, MATCH_TIMEOUT);
 
-    // Helper to stop everything
     let unsubPool = null;
     let recheckInterval = null;
+
     const stopAll = () => {
+      if (stopped) return;
       stopped = true;
       clearInterval(timerInterval);
-      clearInterval(recheckInterval);
       clearTimeout(timeoutId);
       if (unsubPool) unsubPool();
-      matchmakingCleanup.current = null;
+      if (recheckInterval) clearInterval(recheckInterval);
+    };
+    matchmakingCleanup.current = () => {
+      stopAll();
+      deleteDoc(poolRef).catch(() => {});
     };
 
-    // Cache latest pool snapshot for periodic re-evaluation
     let cachedDocs = [];
-
     const checkForMatch = (docs) => {
       if (stopped) return;
-      // Check if we've been matched by someone else
       const myDoc = docs.find(d => d.id === user.uid);
       if (myDoc && myDoc.data().gameId) {
         stopAll();
@@ -364,24 +381,21 @@ const App = () => {
       tryMatchOpponents(docs, poolCollectionPath, poolRef, myWinRate, myTotalGames, startTime, stopAll);
     };
 
-    // 3) onSnapshot for real-time detection of new players
-    unsubPool = onSnapshot(poolCollectionPath, (snapshot) => {
-      if (stopped) return;
-      cachedDocs = snapshot.docs;
-      checkForMatch(cachedDocs);
-    }, (err) => {
-      console.warn('Pool onSnapshot failed:', err);
-    });
+    unsubPool = onSnapshot(
+      query(poolCollectionPath, orderBy('timestamp', 'desc')),
+      (snapshot) => {
+        if (stopped) return;
+        cachedDocs = snapshot.docs;
+        checkForMatch(cachedDocs);
+      },
+      (err) => { console.warn('Pool onSnapshot failed:', err); }
+    );
 
-    // 4) Periodic re-check: as tolerance grows, re-evaluate cached pool data every 2s
-    //    This is critical because onSnapshot only fires on doc changes,
-    //    but tolerance increases over time even without doc changes.
     recheckInterval = setInterval(() => {
       if (stopped || cachedDocs.length === 0) return;
       checkForMatch(cachedDocs);
     }, 2000);
 
-    // 5) Write to pool LAST (non-blocking)
     setDoc(poolRef, {
       uid: user.uid,
       username: userData?.username || 'Unknown',
@@ -393,30 +407,26 @@ const App = () => {
     }).catch((err) => {
       console.error('Matchmaking pool write failed:', err);
       stopAll();
-      setMatchmakingStatus("매칭 서버 연결 실패. AI 대전으로 전환합니다...");
+      setMatchmakingStatus(t('matchServerFailed'));
       setTimeout(() => startComputerGame(), 1500);
     });
+  };
 
-    // 6) Store cleanup for cancel button
-    matchmakingCleanup.current = () => {
-      stopAll();
-      deleteDoc(poolRef).catch(() => {});
-    };
+  const cancelMatchmaking = () => {
+    if (matchmakingCleanup.current) matchmakingCleanup.current();
+    setView('lobby');
   };
 
   const createPvPGame = async (opponentData, forceOrder) => {
     const gameRef = doc(collection(db, 'artifacts', appId, 'games'));
-    // Random color assignment unless forced order is specified (rematch)
     let p1, p2;
     if (forceOrder) {
       p1 = forceOrder.player1;
       p2 = forceOrder.player2;
     } else {
-      // Use crypto for true randomness
       const randomArray = new Uint32Array(1);
       crypto.getRandomValues(randomArray);
       const meFirst = randomArray[0] % 2 === 0;
-      console.log('[Color Assignment] Random value:', randomArray[0], '→ meFirst:', meFirst);
       p1 = meFirst
         ? { uid: user.uid, username: userData?.username }
         : { uid: opponentData.uid, username: opponentData.username };
@@ -424,9 +434,11 @@ const App = () => {
         ? { uid: opponentData.uid, username: opponentData.username }
         : { uid: user.uid, username: userData?.username };
     }
+    const isFriendMatch = forceOrder?.friendMatch || false;
     await setDoc(gameRef, {
       player1: p1,
       player2: p2,
+      playerUids: [p1.uid, p2.uid],
       board: Array(BOARD_SIZE * BOARD_SIZE).fill(0),
       turn: 1,
       moveCount: 0,
@@ -438,6 +450,8 @@ const App = () => {
       lastMoveAt: Date.now(),
       rematchRequests: [],
       rematchGameId: null,
+      friendMatch: isFriendMatch,
+      moves: [],
       createdAt: serverTimestamp()
     });
     return gameRef.id;
@@ -452,20 +466,210 @@ const App = () => {
   };
 
   const startComputerGame = () => {
+    const randomArray = new Uint32Array(1);
+    crypto.getRandomValues(randomArray);
+    const playerIsBlack = randomArray[0] % 2 === 0;
+    const humanPlayer = playerIsBlack ? 1 : 2;
+    const aiPlayer = playerIsBlack ? 2 : 1;
+
     setGameMode('ai');
     setCurrentGame({
-      id: 'forest_ai_' + Date.now(),
+      id: 'ai_' + Date.now(),
       mode: 'ai',
       board: Array(BOARD_SIZE * BOARD_SIZE).fill(0),
       turn: 1,
       moveCount: 0,
       turnMoves: 0,
-      status: 'active'
+      status: 'active',
+      humanPlayer,
+      aiPlayer,
+      moves: [],
     });
     setWinnerModal(null);
     setView('game');
   };
 
+  // --- Friend Match ---
+  const sendFriendInvite = async () => {
+    if (!friendUsername.trim()) return;
+    setError('');
+    try {
+      const snapshot = await getDocs(collection(db, 'artifacts', appId, 'leaderboard'));
+      const target = snapshot.docs.find(d => d.data().username === friendUsername.trim());
+      if (!target) {
+        setError(t('userNotFound'));
+        return;
+      }
+      if (target.data().uid === user.uid) {
+        setError(t('userNotFound'));
+        return;
+      }
+
+      const inviteRef = doc(collection(db, 'artifacts', appId, 'invites'));
+      await setDoc(inviteRef, {
+        fromUid: user.uid,
+        fromUsername: userData.username,
+        toUsername: friendUsername.trim(),
+        toUid: target.data().uid,
+        status: 'pending',
+        gameId: null,
+        createdAt: serverTimestamp()
+      });
+
+      setFriendInviteId(inviteRef.id);
+      setView('friendMatchWaiting');
+
+      const unsub = onSnapshot(inviteRef, (snap) => {
+        if (!snap.exists()) { unsub(); setView('lobby'); return; }
+        const data = snap.data();
+        if (data.status === 'accepted' && data.gameId) {
+          unsub();
+          joinPvPGame(data.gameId);
+        } else if (data.status === 'declined' || data.status === 'cancelled') {
+          unsub();
+          setView('lobby');
+        }
+      });
+    } catch (err) {
+      console.error('Friend invite failed:', err);
+      setError(t('userNotFound'));
+    }
+  };
+
+  const cancelFriendInvite = async () => {
+    if (friendInviteId) {
+      try {
+        await updateDoc(doc(db, 'artifacts', appId, 'invites', friendInviteId), { status: 'cancelled' });
+      } catch (e) { /* ignore */ }
+    }
+    setFriendInviteId(null);
+    setView('lobby');
+  };
+
+  const acceptInvite = async () => {
+    if (!pendingInvite) return;
+    const inviteData = pendingInvite.data();
+    try {
+      const randomArray = new Uint32Array(1);
+      crypto.getRandomValues(randomArray);
+      const inviterFirst = randomArray[0] % 2 === 0;
+      const p1 = inviterFirst
+        ? { uid: inviteData.fromUid, username: inviteData.fromUsername }
+        : { uid: user.uid, username: userData.username };
+      const p2 = inviterFirst
+        ? { uid: user.uid, username: userData.username }
+        : { uid: inviteData.fromUid, username: inviteData.fromUsername };
+
+      const gameRef = doc(collection(db, 'artifacts', appId, 'games'));
+      await setDoc(gameRef, {
+        player1: p1,
+        player2: p2,
+        playerUids: [p1.uid, p2.uid],
+        board: Array(BOARD_SIZE * BOARD_SIZE).fill(0),
+        turn: 1,
+        moveCount: 0,
+        turnMoves: 0,
+        status: 'active',
+        winner: null,
+        loser: null,
+        winReason: null,
+        lastMoveAt: Date.now(),
+        rematchRequests: [],
+        rematchGameId: null,
+        friendMatch: true,
+        moves: [],
+        createdAt: serverTimestamp()
+      });
+
+      await updateDoc(doc(db, 'artifacts', appId, 'invites', pendingInvite.id), {
+        status: 'accepted',
+        gameId: gameRef.id
+      });
+
+      setPendingInvite(null);
+      joinPvPGame(gameRef.id);
+    } catch (err) {
+      console.error('Accept invite failed:', err);
+    }
+  };
+
+  const declineInvite = async () => {
+    if (!pendingInvite) return;
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'invites', pendingInvite.id), { status: 'declined' });
+    } catch (e) { /* ignore */ }
+    setPendingInvite(null);
+  };
+
+  // Listen for incoming friend invites in lobby
+  useEffect(() => {
+    if (!user || view !== 'lobby') return;
+    const q = query(
+      collection(db, 'artifacts', appId, 'invites'),
+      where('toUid', '==', user.uid),
+      where('status', '==', 'pending')
+    );
+    const unsub = onSnapshot(q, (snapshot) => {
+      if (snapshot.docs.length > 0) {
+        setPendingInvite(snapshot.docs[0]);
+      } else {
+        setPendingInvite(null);
+      }
+    });
+    return () => unsub();
+  }, [user, view]);
+
+  // --- Game History ---
+  const fetchGameHistory = async () => {
+    try {
+      const q = query(
+        collection(db, 'artifacts', appId, 'games'),
+        where('playerUids', 'array-contains', user.uid),
+        orderBy('createdAt', 'desc'),
+        firestoreLimit(30)
+      );
+      const snapshot = await getDocs(q);
+      const games = snapshot.docs.map(d => {
+        const data = d.data();
+        const isPlayer1 = data.player1.uid === user.uid;
+        return {
+          id: d.id,
+          player1: data.player1,
+          player2: data.player2,
+          opponentName: isPlayer1 ? data.player2?.username : data.player1?.username,
+          result: data.winner === user.uid ? 'win'
+            : (data.winner && data.winner !== user.uid) ? 'loss'
+            : (data.status === 'finished' && data.winner?.includes?.('player'))
+              ? (((data.winner === 'player1') === isPlayer1) ? 'win' : 'loss')
+              : 'unknown',
+          date: data.createdAt?.toDate?.()?.toLocaleDateString() || '',
+          mode: data.friendMatch ? 'friendly' : 'ranked',
+          moves: data.moves || [],
+          winReason: data.winReason,
+          status: data.status,
+        };
+      }).filter(g => g.status === 'finished');
+      setGameHistoryList(games);
+    } catch (err) {
+      console.error('Game history fetch failed:', err);
+      setGameHistoryList([]);
+    }
+  };
+
+  const viewReplay = (game) => {
+    setReplayGame(game);
+    setReplayMoveIndex(0);
+    setView('replay');
+  };
+
+  // User rank computation
+  const userRank = useMemo(() => {
+    if (!userData || !leaderboard.length) return null;
+    const idx = leaderboard.findIndex(p => p.uid === userData.uid);
+    return idx >= 0 ? idx + 1 : null;
+  }, [leaderboard, userData]);
+
+  // --- GameBoard Component ---
   const GameBoard = ({ game }) => {
     const [board, setBoard] = useState(game.board || Array(BOARD_SIZE * BOARD_SIZE).fill(0));
     const [turn, setTurn] = useState(game.turn || 1);
@@ -474,72 +678,73 @@ const App = () => {
     const [myPlayerNum, setMyPlayerNum] = useState(0);
     const [opponentName, setOpponentName] = useState('');
     const [isMyTurn, setIsMyTurn] = useState(false);
+    const moveCountRef = useRef(game.moveCount || 0);
     const [turnTimeLeft, setTurnTimeLeft] = useState(TURN_TIME_LIMIT);
     const [gameFinished, setGameFinished] = useState(false);
-    const moveCountRef = useRef(game.moveCount || 0);
     const lastMoveAtRef = useRef(Date.now());
     const turnTimerRef = useRef(null);
     const timeoutClaimRef = useRef(false);
+    const [aiMoves, setAiMoves] = useState([]);
 
-    // PvP turn timer countdown
+    // AI first move when AI is black
     useEffect(() => {
-      if (game.mode !== 'pvp' || gameFinished) return;
-      turnTimerRef.current = setInterval(() => {
-        const elapsed = Math.floor((Date.now() - lastMoveAtRef.current) / 1000);
-        const remaining = Math.max(0, TURN_TIME_LIMIT - elapsed);
-        setTurnTimeLeft(remaining);
+      if (game.mode === 'ai' && game.aiPlayer === 1 && moveCount === 0) {
+        setTimeout(() => triggerAiMove(board, 1, 0), 600);
+      }
+    }, []);
 
-        // If it's our turn and time ran out, we lose via timeout
-        if (remaining === 0 && isMyTurn && !timeoutClaimRef.current && !gameFinished) {
+    // PvP: Turn timer countdown
+    useEffect(() => {
+      if (game.mode !== 'pvp') return;
+      turnTimerRef.current = setInterval(() => {
+        if (gameFinished) return;
+        const elapsed = (Date.now() - lastMoveAtRef.current) / 1000;
+        const remaining = Math.max(0, TURN_TIME_LIMIT - elapsed);
+        setTurnTimeLeft(Math.ceil(remaining));
+
+        if (remaining <= 0 && isMyTurn && !timeoutClaimRef.current) {
           timeoutClaimRef.current = true;
-          clearInterval(turnTimerRef.current);
           const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
           updateDoc(gameRef, {
             status: 'finished',
             winner: myPlayerNum === 1 ? 'player2' : 'player1',
             loser: user.uid,
             winReason: 'timeout'
-          }).catch(err => console.error('Timeout update failed:', err));
+          }).catch(console.error);
         }
       }, 200);
       return () => clearInterval(turnTimerRef.current);
-    }, [game.mode, game.id, isMyTurn, myPlayerNum, gameFinished]);
+    }, [game.id, game.mode, isMyTurn, gameFinished, myPlayerNum]);
 
-    // PvP: subscribe to game doc for real-time sync
+    // PvP: Sync game state from Firestore
     useEffect(() => {
       if (game.mode !== 'pvp') return;
       const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
       const unsubscribe = onSnapshot(gameRef, (snapshot) => {
         if (!snapshot.exists()) return;
         const data = snapshot.data();
+
         setBoard(data.board);
         setTurn(data.turn);
         setTurnMoves(data.turnMoves);
         setMoveCount(data.moveCount);
         moveCountRef.current = data.moveCount;
 
-        // Reset turn timer when lastMoveAt changes
-        if (data.lastMoveAt) {
-          lastMoveAtRef.current = data.lastMoveAt;
-          setTurnTimeLeft(TURN_TIME_LIMIT);
-          timeoutClaimRef.current = false;
-        }
-
         const pNum = data.player1.uid === user.uid ? 1 : 2;
         setMyPlayerNum(pNum);
         setIsMyTurn(data.turn === pNum && data.status === 'active');
         setOpponentName(pNum === 1 ? data.player2.username : data.player1.username);
 
-        // Handle rematch: if a new game was created, join it
+        // Handle rematch
         if (data.rematchGameId && data.status === 'finished') {
           joinPvPGame(data.rematchGameId);
           return;
         }
 
-        // If opponent left after game ended, auto-return to lobby
-        if (data.status === 'finished' && data.leftPlayers && data.leftPlayers.length > 0) {
+        // Handle opponent left
+        if (data.leftPlayers && data.leftPlayers.length > 0 && data.status === 'finished') {
           const opponentLeft = data.leftPlayers.some(uid => uid !== user.uid);
-          if (opponentLeft) {
+          if (opponentLeft && winnerModal) {
             setWinnerModal(null);
             setView('lobby');
             fetchLeaderboard();
@@ -547,11 +752,15 @@ const App = () => {
           }
         }
 
-        if (data.status === 'finished') {
+        if (data.lastMoveAt) {
+          lastMoveAtRef.current = data.lastMoveAt;
+          timeoutClaimRef.current = false;
+        }
+
+        if (data.status === 'finished' && !gameFinished) {
           setGameFinished(true);
           clearInterval(turnTimerRef.current);
 
-          // Determine winner/loser UIDs
           let winnerUid, loserUid, winnerName;
           if (data.winReason === 'timeout') {
             winnerUid = data.winner === 'player1' ? data.player1.uid : data.player2.uid;
@@ -564,13 +773,13 @@ const App = () => {
           }
 
           const iWon = winnerUid === user.uid;
-          const reasonText = data.winReason === 'timeout' ? ' (시간 초과)' : '';
+          const reasonText = data.winReason === 'timeout' ? t('timeout') : '';
           const rematchRequests = data.rematchRequests || [];
           const iRequestedRematch = rematchRequests.includes(user.uid);
           const opponentRequestedRematch = rematchRequests.some(uid => uid !== user.uid);
 
           setWinnerModal({
-            text: iWon ? '나의 승리!' + reasonText : `${winnerName} 승리${reasonText}`,
+            text: iWon ? t('myVictory') + reasonText : `${winnerName} ${t('victory')}${reasonText}`,
             isWinner: iWon,
             gameId: game.id,
             isPvP: true,
@@ -578,10 +787,11 @@ const App = () => {
             player2: data.player2,
             iRequestedRematch,
             opponentRequestedRematch,
+            friendMatch: data.friendMatch || false,
           });
 
-          // Only the winner updates stats (prevents double-counting)
-          if (iWon && winnerUid && loserUid) {
+          // Only update stats for ranked matches
+          if (iWon && winnerUid && loserUid && !data.friendMatch) {
             updatePlayerStats(winnerUid, loserUid);
           }
         }
@@ -635,24 +845,32 @@ const App = () => {
           turn: won ? turn : nextTurn,
           turnMoves: nextTurnMoves,
           moveCount: nextMoveCount,
-          // Reset timer on turn switch or game end
           ...(turnSwitching || won ? { lastMoveAt: Date.now() } : {}),
           ...(won ? {
             status: 'finished',
             winner: user.uid,
             winReason: 'connect6'
-          } : {})
+          } : {}),
+          moves: arrayUnion({ idx, player: turn, moveNumber: nextMoveCount, timestamp: Date.now() })
         });
         return;
       }
 
       // AI mode
+      const humanPlayer = game.humanPlayer || 1;
+      const aiPlayer = game.aiPlayer || 2;
+
+      if (turn !== humanPlayer) return;
+
       const newBoard = [...board];
       newBoard[idx] = turn;
 
+      const newMoves = [...aiMoves, { idx, player: turn, moveNumber: moveCountRef.current + 1 }];
+      setAiMoves(newMoves);
+
       if (checkWin(idx, turn, newBoard)) {
         setBoard(newBoard);
-        setWinnerModal({ text: turn === 1 ? "흑돌 승리!" : "백돌 승리!", isWinner: turn === 1 });
+        setWinnerModal({ text: t('youWin'), isWinner: true });
         return;
       }
 
@@ -667,24 +885,23 @@ const App = () => {
       setTurn(nextTurn);
       setTurnMoves(nextTurnMoves);
       setMoveCount(moveCountRef.current);
-
-      if (nextTurn === 2) {
-        setTimeout(() => triggerAiMove(newBoard, 2, nextTurnMoves), 600);
-      }
+      if (nextTurn === aiPlayer) setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), 600);
     };
 
     const triggerAiMove = (currentBoard, aiPlayer, currentAiTurnMoves) => {
       if (winnerModal) return;
       const emptyIndices = currentBoard.map((c, i) => c === 0 ? i : -1).filter(i => i !== -1);
       if (emptyIndices.length === 0) return;
-      const aiIdx = emptyIndices[Math.floor(Math.random() * emptyIndices.length)];
 
+      const aiIdx = emptyIndices[Math.floor(Math.random() * emptyIndices.length)];
       const newBoard = [...currentBoard];
       newBoard[aiIdx] = aiPlayer;
 
+      setAiMoves(prev => [...prev, { idx: aiIdx, player: aiPlayer, moveNumber: moveCountRef.current + 1 }]);
+
       if (checkWin(aiIdx, aiPlayer, newBoard)) {
         setBoard(newBoard);
-        setWinnerModal({ text: "컴퓨터(AI) 승리", isWinner: false });
+        setWinnerModal({ text: t('youLose'), isWinner: false });
         return;
       }
 
@@ -692,14 +909,14 @@ const App = () => {
       let nextTurnMoves = currentAiTurnMoves + 1;
       moveCountRef.current++;
       if (nextTurnMoves === 2) {
-        nextTurn = 1;
+        nextTurn = aiPlayer === 1 ? 2 : 1;
         nextTurnMoves = 0;
       }
       setBoard(newBoard);
       setTurn(nextTurn);
       setTurnMoves(nextTurnMoves);
       setMoveCount(moveCountRef.current);
-      if (nextTurn === 2) setTimeout(() => triggerAiMove(newBoard, 2, nextTurnMoves), 600);
+      if (nextTurn === aiPlayer) setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), 600);
     };
 
     const BOARD_PX = 600;
@@ -709,6 +926,9 @@ const App = () => {
     const timerColor = turnTimeLeft <= 5 ? 'bg-red-500' : turnTimeLeft <= 10 ? 'bg-yellow-500' : 'bg-emerald-500';
     const timerTextColor = turnTimeLeft <= 5 ? 'text-red-600' : turnTimeLeft <= 10 ? 'text-yellow-600' : 'text-emerald-600';
 
+    const humanPlayer = game.humanPlayer || 1;
+    const isHumanTurn = game.mode === 'ai' ? turn === humanPlayer : isMyTurn;
+
     return (
       <div className="flex flex-col items-center">
         <div className="mb-4 flex items-center gap-6 bg-white/70 backdrop-blur-md px-10 py-4 rounded-3xl border border-emerald-100 shadow-sm">
@@ -716,8 +936,8 @@ const App = () => {
            <div className="flex flex-col">
              <span className="text-gray-800 font-bold text-sm">
                {game.mode === 'pvp'
-                 ? (isMyTurn ? "내 차례" : `${opponentName}의 차례`)
-                 : (turn === 1 ? "흑돌 차례" : "백돌 차례")}
+                 ? (isMyTurn ? t('myTurn') : `${opponentName}${t('opponentTurnOf')}`)
+                 : (isHumanTurn ? t('myTurn') : 'AI' + t('opponentTurnOf'))}
              </span>
              <div className="flex items-center gap-2 mt-1">
                <div className="flex gap-1">
@@ -726,8 +946,8 @@ const App = () => {
                </div>
                <span className="text-[10px] text-emerald-600 font-semibold uppercase">
                  {game.mode === 'pvp'
-                   ? (isMyTurn ? 'Your Turn' : 'Waiting...')
-                   : 'Ready to Move'}
+                   ? (isMyTurn ? t('yourTurn') : t('waiting'))
+                   : (isHumanTurn ? t('readyToMove') : t('waiting'))}
                </span>
              </div>
            </div>
@@ -735,7 +955,7 @@ const App = () => {
              <>
                <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
                  <div className={`w-3 h-3 rounded-full ${myPlayerNum === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-                 <span>나</span>
+                 <span>{t('me')}</span>
                  <span className="text-gray-300">vs</span>
                  <div className={`w-3 h-3 rounded-full ${myPlayerNum === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
                  <span>{opponentName}</span>
@@ -747,6 +967,15 @@ const App = () => {
                  </span>
                </div>
              </>
+           )}
+           {game.mode === 'ai' && (
+             <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
+               <div className={`w-3 h-3 rounded-full ${humanPlayer === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+               <span>{t('me')}</span>
+               <span className="text-gray-300">vs</span>
+               <div className={`w-3 h-3 rounded-full ${humanPlayer === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
+               <span>AI</span>
+             </div>
            )}
         </div>
 
@@ -825,6 +1054,125 @@ const App = () => {
     );
   };
 
+  // --- Replay Board Component ---
+  const ReplayBoard = ({ game: replayData }) => {
+    const board = useMemo(() => {
+      const b = Array(BOARD_SIZE * BOARD_SIZE).fill(0);
+      const sortedMoves = [...(replayData.moves || [])].sort((a, b) => a.moveNumber - b.moveNumber);
+      for (let i = 0; i < replayMoveIndex && i < sortedMoves.length; i++) {
+        b[sortedMoves[i].idx] = sortedMoves[i].player;
+      }
+      return b;
+    }, [replayData.moves, replayMoveIndex]);
+
+    const lastMoveIdx = useMemo(() => {
+      if (replayMoveIndex === 0) return -1;
+      const sortedMoves = [...(replayData.moves || [])].sort((a, b) => a.moveNumber - b.moveNumber);
+      return replayMoveIndex > 0 && replayMoveIndex <= sortedMoves.length ? sortedMoves[replayMoveIndex - 1].idx : -1;
+    }, [replayData.moves, replayMoveIndex]);
+
+    const BOARD_PX = 600;
+    const CELL_SIZE = BOARD_PX / (BOARD_SIZE - 1);
+
+    return (
+      <div className="flex flex-col items-center">
+        <div className="mb-4 flex items-center gap-4 bg-white/70 backdrop-blur-md px-8 py-3 rounded-3xl border border-emerald-100 shadow-sm">
+          <span className="text-sm font-bold text-gray-700">
+            {replayData.player1?.username} <span className="text-gray-400">vs</span> {replayData.player2?.username}
+          </span>
+          <span className="text-xs text-gray-400">|</span>
+          <span className="text-sm font-medium text-emerald-600">
+            {replayMoveIndex} / {replayData.moves?.length || 0} {t('moveOf')}
+          </span>
+        </div>
+
+        <div className="relative group mt-2">
+          <div className="relative bg-[#e6c280] rounded-sm border-b-[8px] border-r-[8px] border-[#d4ae6a] shadow-xl">
+            <div
+              className="relative p-[30px]"
+              style={{ width: `${BOARD_PX + 60}px`, height: `${BOARD_PX + 60}px` }}
+            >
+              <svg
+                className="absolute top-[30px] left-[30px] pointer-events-none"
+                width={BOARD_PX}
+                height={BOARD_PX}
+              >
+                {Array.from({ length: BOARD_SIZE }).map((_, i) => (
+                  <React.Fragment key={i}>
+                    <line x1={i * CELL_SIZE} y1="0" x2={i * CELL_SIZE} y2={BOARD_PX} stroke="rgba(0,0,0,0.4)" strokeWidth="1" />
+                    <line x1="0" y1={i * CELL_SIZE} x2={BOARD_PX} y2={i * CELL_SIZE} stroke="rgba(0,0,0,0.4)" strokeWidth="1" />
+                  </React.Fragment>
+                ))}
+                {[3, 9, 15].map(x => [3, 9, 15].map(y => (
+                  <circle key={`${x}-${y}`} cx={x * CELL_SIZE} cy={y * CELL_SIZE} r="3" fill="rgba(0,0,0,0.6)" />
+                )))}
+              </svg>
+
+              <div
+                className="absolute top-[30px] left-[30px] grid"
+                style={{
+                  gridTemplateColumns: `repeat(${BOARD_SIZE}, 1fr)`,
+                  gridTemplateRows: `repeat(${BOARD_SIZE}, 1fr)`,
+                  width: `${BOARD_PX + CELL_SIZE}px`,
+                  height: `${BOARD_PX + CELL_SIZE}px`,
+                  transform: `translate(-${CELL_SIZE / 2}px, -${CELL_SIZE / 2}px)`,
+                }}
+              >
+                {board.map((cell, i) => (
+                  <div
+                    key={i}
+                    className="relative flex items-center justify-center"
+                    style={{ width: `${CELL_SIZE}px`, height: `${CELL_SIZE}px` }}
+                  >
+                    {cell !== 0 && (
+                      <div className={`
+                        z-20 w-[90%] h-[90%] rounded-full transition-all duration-300
+                        ${cell === 1
+                          ? 'bg-gradient-to-br from-gray-700 via-gray-900 to-black shadow-[2px_3px_5px_rgba(0,0,0,0.4),inset_-1px_-1px_2px_rgba(255,255,255,0.1)]'
+                          : 'bg-gradient-to-br from-white via-gray-50 to-gray-200 shadow-[2px_3px_5px_rgba(0,0,0,0.15),inset_-1px_-1px_2px_rgba(0,0,0,0.05)] border border-gray-200'
+                        }
+                        ${i === lastMoveIdx ? 'ring-2 ring-emerald-400 ring-offset-1' : ''}
+                      `}></div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-6 flex items-center gap-4">
+          <button
+            onClick={() => setReplayMoveIndex(0)}
+            className="px-4 py-2 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 border border-gray-200 hover:bg-white transition-all"
+          >
+            &#x23EE;
+          </button>
+          <button
+            onClick={() => setReplayMoveIndex(i => Math.max(0, i - 1))}
+            disabled={replayMoveIndex === 0}
+            className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 border border-gray-200 hover:bg-white transition-all disabled:opacity-40"
+          >
+            <ChevronLeft size={18} className="inline" /> {t('prevMove')}
+          </button>
+          <button
+            onClick={() => setReplayMoveIndex(i => Math.min(replayData.moves?.length || 0, i + 1))}
+            disabled={replayMoveIndex >= (replayData.moves?.length || 0)}
+            className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 border border-gray-200 hover:bg-white transition-all disabled:opacity-40"
+          >
+            {t('nextMove')} <ChevronRight size={18} className="inline" />
+          </button>
+          <button
+            onClick={() => setReplayMoveIndex(replayData.moves?.length || 0)}
+            className="px-4 py-2 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 border border-gray-200 hover:bg-white transition-all"
+          >
+            &#x23ED;
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="min-h-screen bg-[#f7fcf9] text-gray-800 selection:bg-emerald-200 selection:text-emerald-900 overflow-hidden relative" style={{ fontFamily: "'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, 'Helvetica Neue', 'Segoe UI', 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', sans-serif" }}>
       <style>{`
@@ -836,24 +1184,33 @@ const App = () => {
         <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-teal-50/60 blur-[100px] rounded-full"></div>
       </div>
 
+      {/* === LOGIN === */}
       {view === 'login' && (
         <div className="relative z-10 min-h-screen flex items-center justify-center p-6">
-          <div className="bg-white/80 backdrop-blur-xl p-12 rounded-[3rem] border border-white shadow-[0_20px_60px_rgba(0,0,0,0.04)] w-full max-w-md text-center">
-            <div className="mb-8 inline-flex p-6 bg-emerald-50 rounded-full text-emerald-500 border border-emerald-100 shadow-sm">
-              <TreePine size={48} strokeWidth={1.5} />
+          <div className="bg-white/80 backdrop-blur-xl p-12 rounded-[3rem] border border-white shadow-[0_20px_60px_rgba(0,0,0,0.04)] w-full max-w-md text-center relative">
+            {/* Language selector */}
+            <div className="absolute top-6 right-6">
+              <select value={lang} onChange={(e) => setLang(e.target.value)} className="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white text-gray-600 focus:ring-2 focus:ring-emerald-400 outline-none">
+                <option value="ko">한국어</option>
+                <option value="en">English</option>
+              </select>
             </div>
-            <h1 className="text-4xl font-bold tracking-tight mb-2 text-gray-800">FOREST 6</h1>
-            <p className="text-emerald-600 mb-10 font-medium text-sm">지혜의 숲에 오신 것을 환영합니다</p>
+
+            <div className="mb-8 inline-flex p-6 bg-emerald-50 rounded-full text-emerald-500 border border-emerald-100 shadow-sm">
+              <Shield size={48} strokeWidth={1.5} />
+            </div>
+            <h1 className="text-4xl font-bold tracking-tight mb-2 text-gray-800">{t('appTitle')}</h1>
+            <p className="text-emerald-600 mb-10 font-medium text-sm">{t('welcome')}</p>
             {error && <p className="text-red-500 text-sm mb-4">{error}</p>}
 
             {loginMode === 'credentials' ? (
               <div className="space-y-6">
                 <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-6 text-left">
-                  <p className="text-emerald-700 font-semibold text-sm mb-4">계정이 생성되었습니다! 아래 정보를 반드시 저장하세요.</p>
+                  <p className="text-emerald-700 font-semibold text-sm mb-4">{t('accountCreated')}</p>
                   <div className="space-y-3">
                     <div className="flex items-center justify-between bg-white rounded-xl px-4 py-3 border border-gray-100">
                       <div>
-                        <span className="text-xs text-gray-400 block">아이디</span>
+                        <span className="text-xs text-gray-400 block">{t('idLabel')}</span>
                         <span className="text-gray-800 font-mono font-bold select-all">{autoCredentials?.id}</span>
                       </div>
                       <button onClick={() => { navigator.clipboard.writeText(autoCredentials?.id); setCopied('id'); setTimeout(() => setCopied(false), 1500); }} className="p-2 text-gray-400 hover:text-emerald-500 transition-colors">
@@ -862,7 +1219,7 @@ const App = () => {
                     </div>
                     <div className="flex items-center justify-between bg-white rounded-xl px-4 py-3 border border-gray-100">
                       <div>
-                        <span className="text-xs text-gray-400 block">비밀번호</span>
+                        <span className="text-xs text-gray-400 block">{t('pwLabel')}</span>
                         <span className="text-gray-800 font-mono font-bold select-all">{autoCredentials?.pw}</span>
                       </div>
                       <button onClick={() => { navigator.clipboard.writeText(autoCredentials?.pw); setCopied('pw'); setTimeout(() => setCopied(false), 1500); }} className="p-2 text-gray-400 hover:text-emerald-500 transition-colors">
@@ -870,42 +1227,43 @@ const App = () => {
                       </button>
                     </div>
                   </div>
-                  <p className="text-xs text-red-500 mt-4 font-medium">이 정보는 다시 확인할 수 없습니다. 스크린샷이나 메모로 저장하세요!</p>
+                  <p className="text-xs text-red-500 mt-4 font-medium">{t('saveWarning')}</p>
                 </div>
                 <button onClick={() => { setLoginMode('login'); setAutoCredentials(null); setCopied(false); }} className="w-full py-4 bg-emerald-500 hover:bg-emerald-600 rounded-xl font-semibold text-white transition-all shadow-md transform active:scale-[0.98] text-base">
-                  로그인하러 가기
+                  {t('goToLogin')}
                 </button>
               </div>
             ) : loginMode === 'login' ? (
               <>
                 <form onSubmit={handleManualLogin} className="space-y-4">
-                  <input id="id" type="text" placeholder="아이디" required className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" />
-                  <input id="pw" type="password" placeholder="비밀번호" required className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" />
+                  <input id="id" type="text" placeholder={t('loginId')} required className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" />
+                  <input id="pw" type="password" placeholder={t('loginPw')} required className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" />
                   <button disabled={isSubmitting} className="w-full py-4 mt-2 bg-emerald-500 hover:bg-emerald-600 disabled:bg-emerald-300 rounded-xl font-semibold text-white transition-all shadow-md transform active:scale-[0.98] text-base">
-                    {isSubmitting ? "접속 중..." : "입장하기"}
+                    {isSubmitting ? t('loggingIn') : t('loginButton')}
                   </button>
                 </form>
                 <div className="mt-6 flex flex-col gap-3">
                   <button onClick={() => { setLoginMode('register'); setError(""); }} className="text-gray-500 hover:text-emerald-600 text-sm font-medium transition-colors underline underline-offset-4 flex items-center justify-center gap-2">
-                    <UserPlus size={14} /> 계정 생성
+                    <UserPlus size={14} /> {t('createAccount')}
                   </button>
                   <button onClick={handleAutoRegister} disabled={isSubmitting} className="text-gray-400 hover:text-emerald-500 text-xs font-medium transition-colors underline underline-offset-4 disabled:text-gray-300">
-                    {isSubmitting ? "생성 중..." : "수호자 자동 등록"}
+                    {isSubmitting ? t('creating') : t('autoRegister')}
                   </button>
                 </div>
               </>
             ) : (
               <>
                 <form onSubmit={handleManualRegister} className="space-y-4">
-                  <input name="regId" type="text" placeholder="아이디 (영문, 숫자, 3~20자)" required className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" autoComplete="username" />
-                  <input name="regPw" type="password" placeholder="비밀번호 (8자 이상)" required minLength={8} className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" autoComplete="new-password" />
-                  <input name="regPwConfirm" type="password" placeholder="비밀번호 확인" required minLength={8} className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" autoComplete="new-password" />
+                  <input name="regUsername" type="text" placeholder={t('usernamePlaceholder')} required minLength={2} maxLength={12} className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" />
+                  <input name="regId" type="text" placeholder={t('regIdPlaceholder')} required className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" autoComplete="username" />
+                  <input name="regPw" type="password" placeholder={t('regPwPlaceholder')} required minLength={8} className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" autoComplete="new-password" />
+                  <input name="regPwConfirm" type="password" placeholder={t('regPwConfirmPlaceholder')} required minLength={8} className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" autoComplete="new-password" />
                   <button disabled={isSubmitting} className="w-full py-4 mt-2 bg-emerald-500 hover:bg-emerald-600 disabled:bg-emerald-300 rounded-xl font-semibold text-white transition-all shadow-md transform active:scale-[0.98] text-base">
-                    {isSubmitting ? "생성 중..." : "계정 생성"}
+                    {isSubmitting ? t('creating') : t('createAccount')}
                   </button>
                 </form>
                 <button onClick={() => { setLoginMode('login'); setError(""); }} className="mt-6 text-gray-500 hover:text-emerald-600 text-sm font-medium transition-colors underline underline-offset-4">
-                  로그인으로 돌아가기
+                  {t('backToLogin')}
                 </button>
               </>
             )}
@@ -913,69 +1271,117 @@ const App = () => {
         </div>
       )}
 
+      {/* === LOBBY === */}
       {view === 'lobby' && (
         <div className="relative z-10 p-8 md:p-16 max-w-7xl mx-auto">
           <header className="flex flex-col md:flex-row justify-between items-start md:items-end mb-16 gap-6">
             <div>
-              <span className="text-emerald-500 font-semibold tracking-wider text-xs uppercase mb-2 block">Forest Sanctuary Lobby</span>
-              <h1 className="text-5xl font-bold tracking-tight text-gray-800">숲의 로비</h1>
+              <span className="text-emerald-500 font-semibold tracking-wider text-xs uppercase mb-2 block">{t('lobbySubtitle')}</span>
+              <h1 className="text-5xl font-bold tracking-tight text-gray-800">{t('lobbyTitle')}</h1>
             </div>
             <div className="flex items-center gap-6 bg-white/70 p-4 pr-8 rounded-full border border-white backdrop-blur-md shadow-sm">
                <div className="w-14 h-14 bg-emerald-100 rounded-full flex items-center justify-center font-bold text-emerald-700 text-2xl shadow-inner border border-emerald-200">
-                 {userData?.username[0]}
+                 {userData?.username?.[0]}
                </div>
                <div>
-                 <div className="text-lg font-bold text-gray-800 tracking-tight">{userData?.username}</div>
-                 <div className="text-[11px] text-emerald-600 font-medium mt-1 flex items-center gap-2">
-                   <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                   Online Guardian
+                 <div className="text-lg font-bold text-gray-800 tracking-tight flex items-center gap-2">
+                   {userData?.username}
+                   {userRank && (
+                     <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded-full font-bold">#{userRank}</span>
+                   )}
+                 </div>
+                 <div className="text-[11px] text-gray-500 font-medium mt-1 flex items-center gap-3">
+                   <div className="flex items-center gap-1">
+                     <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+                     <span className="text-emerald-600">{t('online')}</span>
+                   </div>
+                   <span>{userData?.wins || 0}{t('winsLabel')} {userData?.losses || 0}{t('lossesLabel')}</span>
+                   <span className="text-emerald-500 font-bold">
+                     {userData?.totalGames > 0 ? ((userData.wins / userData.totalGames) * 100).toFixed(1) : '0.0'}%
+                   </span>
                  </div>
                </div>
-               <button onClick={() => auth.signOut()} className="ml-6 p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-all"><LogOut size={20} /></button>
+               <div className="ml-4 flex items-center gap-2">
+                 <select value={lang} onChange={(e) => handleLangChange(e.target.value)} className="text-xs border border-gray-200 rounded-lg px-2 py-1 bg-white text-gray-600 focus:ring-2 focus:ring-emerald-400 outline-none">
+                   <option value="ko">한국어</option>
+                   <option value="en">English</option>
+                 </select>
+                 <button onClick={() => auth.signOut()} className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-all"><LogOut size={20} /></button>
+               </div>
             </div>
           </header>
 
+          {/* Pending invite banner */}
+          {pendingInvite && (
+            <div className="mb-8 bg-amber-50 border border-amber-200 rounded-2xl p-6 flex items-center justify-between animate-pulse">
+              <div className="flex items-center gap-3">
+                <Users size={24} className="text-amber-600" />
+                <span className="font-bold text-amber-800">
+                  {pendingInvite.data().fromUsername}{t('pendingInviteFrom')}
+                </span>
+                <span className="text-xs text-amber-600">{t('friendMatchNote')}</span>
+              </div>
+              <div className="flex gap-3">
+                <button onClick={acceptInvite} className="px-6 py-2 bg-emerald-500 text-white rounded-xl font-semibold hover:bg-emerald-600 transition-all">{t('acceptInvite')}</button>
+                <button onClick={declineInvite} className="px-6 py-2 bg-gray-200 text-gray-600 rounded-xl font-semibold hover:bg-gray-300 transition-all">{t('declineInvite')}</button>
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
             <div className="lg:col-span-2 space-y-10">
+              {/* Ranked PvP */}
               <div onClick={startMatchmaking} className="relative group bg-white/80 p-12 rounded-[3rem] shadow-sm cursor-pointer overflow-hidden transition-all hover:shadow-md border border-white hover:border-emerald-100">
                 <div className="relative z-10">
                   <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-full text-xs font-semibold text-emerald-600 mb-6 border border-emerald-100">
-                    매칭 가능
+                    {t('matchAvailable')}
                   </div>
-                  <h2 className="text-4xl font-bold mb-4 text-gray-800 tracking-tight">실시간 대전</h2>
-                  <p className="text-gray-500 max-w-sm mb-12 text-base leading-relaxed">전 세계의 수호자들과 지혜를 겨루고 숲의 정점에 도달하세요.</p>
+                  <h2 className="text-4xl font-bold mb-4 text-gray-800 tracking-tight">{t('pvpTitle')}</h2>
+                  <p className="text-gray-500 max-w-sm mb-12 text-base leading-relaxed">{t('pvpDesc')}</p>
                   <div className="inline-flex items-center gap-3 bg-emerald-500 text-white px-8 py-4 rounded-2xl font-semibold text-sm shadow-md group-hover:bg-emerald-600 transition-colors">
-                    대결 시작 <Play size={18} fill="currentColor" />
+                    {t('startMatch')} <Play size={18} fill="currentColor" />
                   </div>
-                </div>
-                <div className="absolute -right-10 -bottom-10 opacity-[0.03] group-hover:opacity-[0.06] transition-opacity duration-500 pointer-events-none">
-                  <TreePine size={400} strokeWidth={1} />
                 </div>
               </div>
 
+              {/* AI + Friend + History */}
               <div className="grid grid-cols-2 gap-6">
                 <button onClick={startComputerGame} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-emerald-200 hover:bg-white shadow-sm transition-all text-left group">
                   <Cpu className="text-emerald-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">인공지능 대결</h3>
-                  <p className="text-xs text-gray-500 font-medium">Solo Training Mode</p>
+                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('aiTitle')}</h3>
+                  <p className="text-xs text-gray-500 font-medium">{t('aiSubtitle')}</p>
                 </button>
+                <button onClick={() => { setFriendUsername(''); setError(''); setView('friendMatch'); }} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-blue-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <Users className="text-blue-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('friendMatch')}</h3>
+                  <p className="text-xs text-gray-500 font-medium">{t('friendMatchDesc')}</p>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-6">
                 <button onClick={startComputerGame} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-teal-200 hover:bg-white shadow-sm transition-all text-left group">
                   <Shield className="text-teal-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
-                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">숲의 시련</h3>
-                  <p className="text-xs text-gray-500 font-medium">Hardcore Challenge</p>
+                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('challengeTitle')}</h3>
+                  <p className="text-xs text-gray-500 font-medium">{t('challengeSubtitle')}</p>
+                </button>
+                <button onClick={() => { fetchGameHistory(); setView('history'); }} className="p-8 bg-white/70 rounded-[2.5rem] border border-white hover:border-purple-200 hover:bg-white shadow-sm transition-all text-left group">
+                  <History className="text-purple-400 mb-6 w-10 h-10 group-hover:scale-110 transition-transform" />
+                  <h3 className="text-2xl font-bold text-gray-800 tracking-tight mb-2">{t('gameHistory')}</h3>
+                  <p className="text-xs text-gray-500 font-medium">{t('gameHistoryDesc')}</p>
                 </button>
               </div>
             </div>
 
+            {/* Leaderboard */}
             <div className="bg-white/70 rounded-[3rem] border border-white shadow-sm p-10 backdrop-blur-md">
               <div className="flex items-center justify-between mb-10">
                 <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2">
-                  <Trophy size={20} className="text-yellow-500" /> 명예의 전당
+                  <Trophy size={20} className="text-yellow-500" /> {t('hallOfFame')}
                 </h3>
               </div>
               <div className="space-y-6">
                 {leaderboard.length === 0 ? (
-                  <p className="text-gray-400 text-sm text-center py-4">아직 기록이 없습니다</p>
+                  <p className="text-gray-400 text-sm text-center py-4">{t('noRecords')}</p>
                 ) : leaderboard.map((player, i) => (
                   <div key={player.uid} className="flex justify-between items-center group w-full">
                     <div className="flex items-center gap-4 flex-1">
@@ -983,7 +1389,7 @@ const App = () => {
                       <span className="font-medium text-gray-600 group-hover:text-gray-900 transition-colors truncate">{player.username}</span>
                     </div>
                     <div className="flex items-center gap-3 ml-4 shrink-0">
-                      <span className="text-xs text-gray-400">{player.wins}승 {player.losses}패</span>
+                      <span className="text-xs text-gray-400">{player.wins}{t('winsLabel')} {player.losses}{t('lossesLabel')}</span>
                       <span className="font-semibold text-emerald-500 text-sm">{player.totalGames > 0 ? ((player.wins / player.totalGames) * 100).toFixed(1) : '0.0'}%</span>
                     </div>
                   </div>
@@ -994,6 +1400,65 @@ const App = () => {
         </div>
       )}
 
+      {/* === FRIEND MATCH === */}
+      {view === 'friendMatch' && (
+        <div className="relative z-10 min-h-screen flex items-center justify-center">
+          <div className="text-center bg-white/60 backdrop-blur-md p-16 rounded-[4rem] border border-white shadow-xl max-w-md w-full">
+            <div className="mb-8 inline-flex p-6 bg-blue-50 rounded-full text-blue-500 border border-blue-100 shadow-sm">
+              <Users size={48} strokeWidth={1.5} />
+            </div>
+            <h2 className="text-3xl font-bold text-gray-800 tracking-tight mb-2">{t('friendMatch')}</h2>
+            <p className="text-gray-400 text-sm mb-8">{t('friendMatchNote')}</p>
+            {error && <p className="text-red-500 text-sm mb-4">{error}</p>}
+            <div className="space-y-4">
+              <input
+                type="text"
+                value={friendUsername}
+                onChange={(e) => setFriendUsername(e.target.value)}
+                placeholder={t('enterUsername')}
+                className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-blue-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm"
+                onKeyDown={(e) => e.key === 'Enter' && sendFriendInvite()}
+              />
+              <button
+                onClick={sendFriendInvite}
+                className="w-full py-4 bg-blue-500 hover:bg-blue-600 rounded-xl font-semibold text-white transition-all shadow-md transform active:scale-[0.98] text-base"
+              >
+                {t('sendInvite')}
+              </button>
+              <button
+                onClick={() => { setError(''); setView('lobby'); }}
+                className="w-full py-3 bg-gray-100 text-gray-600 hover:bg-gray-200 rounded-xl text-sm font-semibold transition-all"
+              >
+                {t('cancelSearch')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* === FRIEND MATCH WAITING === */}
+      {view === 'friendMatchWaiting' && (
+        <div className="relative z-10 min-h-screen flex items-center justify-center">
+          <div className="text-center bg-white/60 backdrop-blur-md p-16 rounded-[4rem] border border-white shadow-xl">
+            <div className="relative mb-12 inline-block">
+              <div className="absolute inset-0 border-[2px] border-blue-200 rounded-full animate-ping scale-150 opacity-50"></div>
+              <div className="bg-white p-8 rounded-full text-blue-500 relative z-10 border border-blue-100 shadow-md">
+                <Users size={50} />
+              </div>
+            </div>
+            <h2 className="text-3xl font-bold text-gray-800 tracking-tight mb-4">{t('friendMatch')}</h2>
+            <p className="text-gray-500 font-medium text-sm mb-8">{t('inviteWaiting')}</p>
+            <button
+              onClick={cancelFriendInvite}
+              className="px-8 py-3 bg-gray-100 text-gray-600 hover:bg-gray-200 rounded-xl text-sm font-semibold transition-all"
+            >
+              {t('cancelInvite')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* === MATCHMAKING === */}
       {view === 'matchmaking' && (
         <div className="relative z-10 min-h-screen flex items-center justify-center">
           <div className="text-center bg-white/60 backdrop-blur-md p-16 rounded-[4rem] border border-white shadow-xl">
@@ -1003,16 +1468,16 @@ const App = () => {
                  <RefreshCw size={50} className="animate-spin" />
                </div>
              </div>
-             <h2 className="text-3xl font-bold text-gray-800 tracking-tight mb-4">대전 상대 탐색 중...</h2>
+             <h2 className="text-3xl font-bold text-gray-800 tracking-tight mb-4">{t('searchingOpponent')}</h2>
              <p className="text-gray-500 font-medium text-sm mb-6">{matchmakingStatus}</p>
 
              <div className="flex items-center justify-center gap-4 mb-10">
                <div className="inline-flex items-center gap-3 bg-white px-6 py-3 rounded-full border border-emerald-100 text-gray-700 font-medium shadow-sm">
                  <Clock size={18} className="text-emerald-500" />
-                 <span>{elapsedTime}초 경과</span>
+                 <span>{elapsedTime}{t('elapsed')}</span>
                </div>
                <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-3 rounded-full border border-emerald-100 text-emerald-700 font-medium shadow-sm text-sm">
-                 <span>허용 범위: {Math.min(Math.floor(elapsedTime / 2) * 10, 100)}%</span>
+                 <span>{t('toleranceRange')}: {Math.min(Math.floor(elapsedTime / 2) * 10, 100)}%</span>
                </div>
              </div>
 
@@ -1021,22 +1486,23 @@ const App = () => {
                  onClick={cancelMatchmaking}
                  className="px-8 py-3 bg-gray-100 text-gray-600 hover:bg-gray-200 rounded-xl text-sm font-semibold transition-all"
                >
-                 탐색 취소
+                 {t('cancelSearch')}
                </button>
              </div>
           </div>
         </div>
       )}
 
+      {/* === GAME === */}
       {view === 'game' && (
         <div className="relative z-10 min-h-screen flex flex-col items-center py-10">
           <header className="w-full max-w-6xl px-8 flex justify-between items-center mb-8">
              <button onClick={() => setView('lobby')} className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
-               로비로 돌아가기
+               {t('returnToLobby')}
              </button>
              <div className="text-center">
-               <div className="text-xs font-semibold text-emerald-500 mb-1">Combat Arena</div>
-               <div className="text-2xl font-bold tracking-tight text-gray-800">숲의 전장</div>
+               <div className="text-xs font-semibold text-emerald-500 mb-1">{t('combatArena')}</div>
+               <div className="text-2xl font-bold tracking-tight text-gray-800">{t('gameBoard')}</div>
              </div>
              <div className="w-[130px]"></div>
           </header>
@@ -1046,6 +1512,85 @@ const App = () => {
         </div>
       )}
 
+      {/* === GAME HISTORY === */}
+      {view === 'history' && (
+        <div className="relative z-10 min-h-screen p-8 md:p-16 max-w-4xl mx-auto">
+          <header className="flex justify-between items-center mb-10">
+            <div>
+              <h1 className="text-4xl font-bold tracking-tight text-gray-800">{t('gameHistory')}</h1>
+            </div>
+            <button onClick={() => setView('lobby')} className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
+              {t('returnToLobby')}
+            </button>
+          </header>
+
+          <div className="space-y-4">
+            {gameHistoryList.length === 0 ? (
+              <div className="text-center py-20 bg-white/60 rounded-[3rem] border border-white">
+                <History size={48} className="text-gray-300 mx-auto mb-4" />
+                <p className="text-gray-400 text-sm">{t('noGames')}</p>
+              </div>
+            ) : gameHistoryList.map((game) => (
+              <div
+                key={game.id}
+                onClick={() => game.moves.length > 0 ? viewReplay(game) : null}
+                className={`flex items-center justify-between p-6 bg-white/80 rounded-2xl border border-white shadow-sm transition-all ${game.moves.length > 0 ? 'cursor-pointer hover:shadow-md hover:border-emerald-100' : ''}`}
+              >
+                <div className="flex items-center gap-4">
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold ${
+                    game.result === 'win' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'
+                  }`}>
+                    {game.result === 'win' ? 'W' : 'L'}
+                  </div>
+                  <div>
+                    <div className="font-bold text-gray-800">
+                      vs {game.opponentName || 'AI'}
+                    </div>
+                    <div className="text-xs text-gray-400 flex items-center gap-2 mt-1">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                        game.mode === 'friendly' ? 'bg-blue-50 text-blue-600' : 'bg-emerald-50 text-emerald-600'
+                      }`}>
+                        {game.mode === 'friendly' ? t('friendly') : t('ranked')}
+                      </span>
+                      {game.winReason === 'timeout' && <span className="text-amber-500">{t('timeout')}</span>}
+                      {game.date && <span>{game.date}</span>}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  {game.moves.length > 0 && (
+                    <span className="text-xs text-gray-400">{game.moves.length} {t('moveOf')}</span>
+                  )}
+                  {game.moves.length > 0 && <ChevronRight size={18} className="text-gray-400" />}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* === REPLAY === */}
+      {view === 'replay' && replayGame && (
+        <div className="relative z-10 min-h-screen flex flex-col items-center py-10">
+          <header className="w-full max-w-6xl px-8 flex justify-between items-center mb-8">
+            <button onClick={() => setView('history')} className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
+              <ChevronLeft size={16} className="inline" /> {t('backToHistory')}
+            </button>
+            <div className="text-center">
+              <div className="text-xs font-semibold text-emerald-500 mb-1">{t('replay')}</div>
+              <div className="text-2xl font-bold tracking-tight text-gray-800">
+                {replayGame.result === 'win' ? t('win') : t('loss')}
+              </div>
+            </div>
+            <div className="w-[130px]"></div>
+          </header>
+          <div className="flex-1 flex items-center justify-center w-full">
+            <ReplayBoard game={replayGame} />
+          </div>
+        </div>
+      )}
+
+      {/* === WINNER MODAL === */}
       {winnerModal && (() => {
         const isWin = typeof winnerModal === 'object' ? winnerModal.isWinner : true;
         const modalText = typeof winnerModal === 'object' ? winnerModal.text : winnerModal;
@@ -1065,12 +1610,12 @@ const App = () => {
             const newRequests = [...requests, user.uid];
 
             if (newRequests.length >= 2) {
-              // Both requested: create new game with swapped colors
               const oldP1 = data.player1;
               const oldP2 = data.player2;
               const newGameId = await createPvPGame(null, {
                 player1: oldP2,
-                player2: oldP1
+                player2: oldP1,
+                friendMatch: data.friendMatch || false,
               });
               await updateDoc(gameRef, {
                 rematchRequests: newRequests,
@@ -1102,15 +1647,13 @@ const App = () => {
                 </div>
               )}
               <h2 className={`text-4xl font-bold mb-4 tracking-tight ${isWin ? 'text-gray-800' : 'text-gray-700'}`}>
-                {isWin ? '위대한 승리' : '아쉬운 패배'}
+                {isWin ? t('victory') : t('defeat')}
               </h2>
               <p className={`font-medium mb-8 text-lg leading-relaxed ${isWin ? 'text-gray-600' : 'text-gray-500'}`}>
                 <span className={`block text-2xl mb-2 font-bold ${isWin ? 'text-emerald-600' : 'text-red-500'}`}>
                   {modalText}
                 </span>
-                {isWin
-                  ? '숲의 가장 깊은 곳을 정복했습니다.'
-                  : '다음에는 더 강해져서 돌아오세요.'}
+                {isWin ? t('victoryMessage') : t('defeatMessage')}
               </p>
               <div className="space-y-3">
                 {isPvP && (
@@ -1128,16 +1671,15 @@ const App = () => {
                     <div className="flex items-center justify-center gap-2">
                       <RefreshCw size={20} />
                       {iRequestedRematch
-                        ? '상대방 수락 대기 중...'
+                        ? t('rematchWaiting')
                         : opponentRequestedRematch
-                          ? '상대방이 재대결을 원합니다! 수락하기'
-                          : '재대결 (색 교대)'}
+                          ? t('rematchAccept')
+                          : t('rematchRequest')}
                     </div>
                   </button>
                 )}
                 <button
                   onClick={() => {
-                    // Notify opponent that we left
                     if (isPvP && winnerModal.gameId) {
                       const gameRef = doc(db, 'artifacts', appId, 'games', winnerModal.gameId);
                       getDoc(gameRef).then(snap => {
@@ -1157,7 +1699,7 @@ const App = () => {
                       : 'bg-gray-700 hover:bg-gray-800 text-white'
                   }`}
                 >
-                  로비로 귀환
+                  {t('returnToLobbyButton')}
                 </button>
               </div>
             </div>

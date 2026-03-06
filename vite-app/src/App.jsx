@@ -74,6 +74,7 @@ const App = () => {
   const matchmakingCleanup = useRef(null);
   const gameResultHandled = useRef(false);
   const pendingUsername = useRef(null);
+  const currentAuthUid = useRef(null); // tracks latest auth uid to abort stale callbacks
   const [lang, setLang] = useState('ko');
 
   // Friend match state
@@ -114,9 +115,13 @@ const App = () => {
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
+      currentAuthUid.current = u?.uid || null;
       setUser(u);
       if (u) {
-        await fetchUserData(u.uid);
+        const uid = u.uid;
+        await fetchUserData(uid);
+        // If user changed (e.g. signed out) while fetchUserData was running, abort
+        if (currentAuthUid.current !== uid) return;
         ensureAiBotExists().catch(() => {});
         fetchLeaderboard();
         setView('lobby');
@@ -351,6 +356,7 @@ const App = () => {
   };
 
   const startMatchmaking = () => {
+    if (!user) { setView('login'); return; } // Guard: user must be logged in
     setView('matchmaking');
     setMatchmakingStatus(`${t('searchingOpponent')} (${t('toleranceLabel')}: 0%)`);
     setElapsedTime(0);

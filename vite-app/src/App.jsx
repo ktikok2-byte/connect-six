@@ -8,7 +8,7 @@ import {
   signInWithEmailAndPassword
 } from 'firebase/auth';
 import {
-  getFirestore,
+  initializeFirestore,
   doc,
   setDoc,
   getDoc,
@@ -43,7 +43,9 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const analytics = getAnalytics(app);
 const auth = getAuth(app);
-const db = getFirestore(app);
+// experimentalAutoDetectLongPolling: falls back to HTTP long-polling when
+// WebSockets are blocked (common on mobile networks / some browsers)
+const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
 const appId = import.meta.env.VITE_APP_ID || 'connect6-forest-v4';
 
 const BOARD_SIZE = 19;
@@ -434,7 +436,7 @@ const App = () => {
       checkForMatch(cachedDocs);
     }, 2000);
 
-    setDoc(poolRef, {
+    const poolData = {
       uid: user.uid,
       username: userData?.username || 'Unknown',
       winRate: myWinRate,
@@ -442,12 +444,26 @@ const App = () => {
       enteredAt: Date.now(),
       timestamp: serverTimestamp(),
       gameId: null
-    }).catch((err) => {
-      console.error('Matchmaking pool write failed:', err);
-      stopAll();
-      setMatchmakingStatus(t('matchServerFailed'));
-      setTimeout(() => startComputerGame(), 1500);
-    });
+    };
+
+    const writePool = (retrying) => {
+      setDoc(poolRef, poolData).catch((err) => {
+        console.error('Matchmaking pool write failed:', err, 'retrying:', retrying);
+        if (!stopped) {
+          if (!retrying) {
+            // First failure: retry once after 2 seconds (don't kill the timer)
+            setMatchmakingStatus(`${t('searchingOpponent')} (retrying...)`);
+            setTimeout(() => { if (!stopped) writePool(true); }, 2000);
+          } else {
+            // Second failure: fall back to AI game
+            stopAll();
+            setMatchmakingStatus(t('matchServerFailed'));
+            setTimeout(() => startComputerGame(), 1500);
+          }
+        }
+      });
+    };
+    writePool(false);
   };
 
   const cancelMatchmaking = () => {

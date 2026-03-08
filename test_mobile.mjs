@@ -3,7 +3,7 @@
  */
 import { chromium, devices } from 'playwright';
 
-const BASE_URL = 'http://localhost:5173';
+const BASE_URL = process.env.TEST_URL || 'http://localhost:5173';
 const iPhone = devices['iPhone 13'];
 
 async function setupPlayer(browser, label) {

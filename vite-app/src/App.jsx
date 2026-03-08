@@ -319,7 +319,13 @@ const App = () => {
     const myElapsed = Math.floor((now - startTime) / 1000);
     const myTolerance = calcTolerance(myElapsed);
 
-    const allOpponents = docs.filter(d => d.id !== user.uid && !d.data().gameId);
+    // Ignore stale entries (> 3 min old and still no gameId — likely crashed clients)
+    const STALE_MS = 3 * 60 * 1000;
+    const allOpponents = docs.filter(d => {
+      if (d.id === user.uid || d.data().gameId) return false;
+      const age = d.data().enteredAt ? now - d.data().enteredAt : 0;
+      return age < STALE_MS;
+    });
     const winRateDiff = (oppData) => Math.abs((oppData.winRate || 0) - myWinRate);
     const matchable = allOpponents.filter(d => {
       const diff = winRateDiff(d.data());
@@ -1312,75 +1318,71 @@ const App = () => {
     const isHumanTurn = game.mode === 'ai' ? turn === humanPlayer : isMyTurn;
 
     return (
-      <div className="flex flex-col items-center">
-        <div className="mb-4 flex items-center gap-6 bg-white/70 backdrop-blur-md px-10 py-4 rounded-3xl border border-emerald-100 shadow-sm">
-           <div className={`w-8 h-8 rounded-full shadow-md transition-all duration-500 transform ${turn === 1 ? 'bg-gray-800 scale-110' : 'bg-white scale-110 border border-gray-200'}`}></div>
-           <div className="flex flex-col">
-             <span className="text-gray-800 font-bold text-sm">
-               {game.mode === 'pvp'
-                 ? (isMyTurn ? t('myTurn') : `${opponentName}${t('opponentTurnOf')}`)
-                 : (isHumanTurn ? t('myTurn') : `${AI_BOT_DISPLAY_NAME}${t('opponentTurnOf')}`)}
-             </span>
-             <div className="flex items-center gap-2 mt-1">
-               <div className="flex gap-1">
-                 <div className={`w-2 h-2 rounded-full ${turnMoves < 2 ? 'bg-emerald-500' : 'bg-gray-200'}`}></div>
-                 <div className={`w-2 h-2 rounded-full ${moveCount === 0 || turnMoves < 1 ? 'bg-emerald-500' : 'bg-gray-200'}`}></div>
-               </div>
-               <span className="text-[10px] text-emerald-600 font-semibold uppercase">
+      <div className="flex flex-col items-center w-full px-2">
+        <div className="mb-2 w-full flex flex-wrap items-center justify-between gap-2 bg-white/70 backdrop-blur-md px-3 sm:px-8 py-3 rounded-2xl sm:rounded-3xl border border-emerald-100 shadow-sm">
+           {/* Left: stone color + turn status */}
+           <div className="flex items-center gap-3">
+             <div className={`w-7 h-7 rounded-full shadow-md transition-all duration-500 ${turn === 1 ? 'bg-gray-800' : 'bg-white border-2 border-gray-300'}`}></div>
+             <div className="flex flex-col">
+               <span className="text-gray-800 font-bold text-xs sm:text-sm leading-tight">
                  {game.mode === 'pvp'
-                   ? (isMyTurn ? t('yourTurn') : t('waiting'))
-                   : (isHumanTurn ? t('readyToMove') : t('waiting'))}
+                   ? (isMyTurn ? t('myTurn') : `${opponentName}${t('opponentTurnOf')}`)
+                   : (isHumanTurn ? t('myTurn') : `${AI_BOT_DISPLAY_NAME}${t('opponentTurnOf')}`)}
                </span>
+               <div className="flex items-center gap-1 mt-0.5">
+                 <div className="flex gap-1">
+                   <div className={`w-1.5 h-1.5 rounded-full ${turnMoves < 2 ? 'bg-emerald-500' : 'bg-gray-200'}`}></div>
+                   <div className={`w-1.5 h-1.5 rounded-full ${moveCount === 0 || turnMoves < 1 ? 'bg-emerald-500' : 'bg-gray-200'}`}></div>
+                 </div>
+                 <span className="text-[9px] text-emerald-600 font-semibold uppercase">
+                   {game.mode === 'pvp'
+                     ? (isMyTurn ? t('yourTurn') : t('waiting'))
+                     : (isHumanTurn ? t('readyToMove') : t('waiting'))}
+                 </span>
+               </div>
              </div>
            </div>
-           {game.mode === 'pvp' && (
-             <>
-               <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
+           {/* Right: color indicator + timer */}
+           <div className="flex items-center gap-3">
+             {game.mode === 'pvp' && (
+               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                  <div className={`w-3 h-3 rounded-full ${myPlayerNum === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
                  <span>{t('me')}</span>
                  <span className="text-gray-300">vs</span>
                  <div className={`w-3 h-3 rounded-full ${myPlayerNum === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-                 <span>{opponentName}</span>
+                 <span className="max-w-[80px] truncate">{opponentName}</span>
                </div>
-               <div className="ml-4 flex items-center gap-2">
-                 <Timer size={16} className={timerTextColor} />
-                 <span className={`font-bold text-lg tabular-nums ${timerTextColor} ${turnTimeLeft <= 5 ? 'animate-pulse' : ''}`}>
-                   {turnTimeLeft}s
-                 </span>
-               </div>
-             </>
-           )}
-           {game.mode === 'ai' && (
-             <>
-               <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
+             )}
+             {game.mode === 'ai' && (
+               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                  <div className={`w-3 h-3 rounded-full ${humanPlayer === 1 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
                  <span>{t('me')}</span>
                  <span className="text-gray-300">vs</span>
                  <div className={`w-3 h-3 rounded-full ${humanPlayer === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-                 <span>{AI_BOT_DISPLAY_NAME}</span>
+                 <span>AI</span>
                </div>
-               <div className="ml-4 flex items-center gap-2">
-                 <Timer size={16} className={timerTextColor} />
-                 <span className={`font-bold text-lg tabular-nums ${timerTextColor} ${turnTimeLeft <= 5 ? 'animate-pulse' : ''}`}>
+             )}
+             {game.mode === 'local' && (
+               <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                 <div className="w-3 h-3 rounded-full bg-gray-800"></div>
+                 <span className="text-gray-300">vs</span>
+                 <div className="w-3 h-3 rounded-full bg-white border border-gray-300"></div>
+               </div>
+             )}
+             {(game.mode === 'pvp' || game.mode === 'ai') && (
+               <div className="flex items-center gap-1">
+                 <Timer size={14} className={timerTextColor} />
+                 <span className={`font-bold text-base tabular-nums ${timerTextColor} ${turnTimeLeft <= 5 ? 'animate-pulse' : ''}`}>
                    {turnTimeLeft}s
                  </span>
                </div>
-             </>
-           )}
-           {game.mode === 'local' && (
-             <div className="ml-4 flex items-center gap-2 text-xs text-gray-500">
-               <div className="w-3 h-3 rounded-full bg-gray-800"></div>
-               <span>{t('blackTurn')?.split(' ')[0]}</span>
-               <span className="text-gray-300">vs</span>
-               <div className="w-3 h-3 rounded-full bg-white border border-gray-300"></div>
-               <span>{t('whiteTurn')?.split(' ')[0]}</span>
-             </div>
-           )}
+             )}
+           </div>
         </div>
 
         {/* Turn timer bar for PvP and AI */}
         {(game.mode === 'pvp' || game.mode === 'ai') && !gameFinished && (
-          <div className="w-full max-w-full mb-4 h-2 bg-gray-200 rounded-full overflow-hidden">
+          <div className="w-full mb-2 h-1.5 bg-gray-200 rounded-full overflow-hidden">
             <div
               className={`h-full ${timerColor} rounded-full transition-all duration-200 ease-linear`}
               style={{ width: `${timerPercent}%` }}
@@ -2047,20 +2049,20 @@ const App = () => {
 
       {/* === MATCHMAKING === */}
       {view === 'matchmaking' && (
-        <div className="relative z-10 min-h-screen flex items-center justify-center">
-          <div className="text-center bg-white/60 backdrop-blur-md p-16 rounded-[4rem] border border-white shadow-xl">
-             <div className="relative mb-12 inline-block">
+        <div className="relative z-10 min-h-screen flex items-center justify-center px-4">
+          <div className="text-center bg-white/60 backdrop-blur-md p-6 sm:p-16 rounded-[2rem] sm:rounded-[4rem] border border-white shadow-xl w-full max-w-sm sm:max-w-lg">
+             <div className="relative mb-8 sm:mb-12 inline-block">
                <div className="absolute inset-0 border-[2px] border-emerald-200 rounded-full animate-ping scale-150 opacity-50"></div>
-               <div className="bg-white p-8 rounded-full text-emerald-500 relative z-10 border border-emerald-100 shadow-md">
-                 <RefreshCw size={50} className="animate-spin" />
+               <div className="bg-white p-6 sm:p-8 rounded-full text-emerald-500 relative z-10 border border-emerald-100 shadow-md">
+                 <RefreshCw size={40} className="animate-spin" />
                </div>
              </div>
-             <h2 className="text-3xl font-bold text-gray-800 tracking-tight mb-4">{t('searchingOpponent')}</h2>
-             <p className="text-gray-500 font-medium text-sm mb-6">{matchmakingStatus}</p>
+             <h2 className="text-2xl sm:text-3xl font-bold text-gray-800 tracking-tight mb-3 sm:mb-4">{t('searchingOpponent')}</h2>
+             <p className="text-gray-500 font-medium text-sm mb-5 sm:mb-6">{matchmakingStatus}</p>
 
-             <div className="flex items-center justify-center gap-4 mb-10">
-               <div className="inline-flex items-center gap-3 bg-white px-6 py-3 rounded-full border border-emerald-100 text-gray-700 font-medium shadow-sm">
-                 <Clock size={18} className="text-emerald-500" />
+             <div className="flex flex-wrap items-center justify-center gap-3 mb-8 sm:mb-10">
+               <div className="inline-flex items-center gap-2 bg-white px-4 py-3 rounded-full border border-emerald-100 text-gray-700 font-medium shadow-sm text-sm">
+                 <Clock size={16} className="text-emerald-500" />
                  <span>{elapsedTime}{t('elapsed')}</span>
                </div>
                <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-3 rounded-full border border-emerald-100 text-emerald-700 font-medium shadow-sm text-sm">
@@ -2082,16 +2084,16 @@ const App = () => {
 
       {/* === GAME === */}
       {view === 'game' && (
-        <div className="relative z-10 min-h-screen flex flex-col items-center py-10">
-          <header className="w-full max-w-6xl px-8 flex justify-between items-center mb-8">
-             <button onClick={handleLeaveGame} className="px-6 py-3 bg-white/80 rounded-xl text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
+        <div className="relative z-10 min-h-screen flex flex-col items-center py-4 sm:py-10">
+          <header className="w-full max-w-6xl px-3 sm:px-8 flex justify-between items-center mb-4 sm:mb-8">
+             <button onClick={handleLeaveGame} className="px-3 sm:px-6 py-2 sm:py-3 bg-white/80 rounded-xl text-xs sm:text-sm font-semibold text-gray-600 hover:text-gray-900 border border-white hover:border-gray-200 transition-all shadow-sm">
                {t('returnToLobby')}
              </button>
              <div className="text-center">
-               <div className="text-xs font-semibold text-emerald-500 mb-1">{t('combatArena')}</div>
-               <div className="text-2xl font-bold tracking-tight text-gray-800">{t('gameBoard')}</div>
+               <div className="text-xs font-semibold text-emerald-500 mb-0.5">{t('combatArena')}</div>
+               <div className="text-lg sm:text-2xl font-bold tracking-tight text-gray-800">{t('gameBoard')}</div>
              </div>
-             <div className="w-[130px]"></div>
+             <div className="w-[80px] sm:w-[130px]"></div>
           </header>
           <div className="flex-1 flex items-center justify-center w-full">
             <GameBoard game={currentGame} />

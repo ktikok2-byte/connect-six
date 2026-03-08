@@ -56,6 +56,21 @@ const TURN_TIME_LIMIT = 30; // seconds per turn
 const AI_BOT_UID = 'ai_bot_v1';
 const AI_BOT_DISPLAY_NAME = 'Player_x7k2';
 
+// Human-looking names for the local AI opponent (same pool as bots.mjs)
+const BOT_NAMES = [
+  '하늘별','달빛여행','봄바람','여름밤','가을달','별똥별','새벽빛','초원바람','푸른하늘','따뜻한봄',
+  '빠른번개','강한폭풍','차가운달','불꽃검사','번개전사','용맹한별','지혜의검','전설검사','무적전사','영웅의별',
+  '은하수','별자리','우주탐험','화성여행','목성인','꿈나무','미래의별','희망의빛','행복한달','평화의검',
+  '불굴전사','빠른발검','매서운눈','강철심장','철의의지','검은독수리','흰달빛','붉은여우','파란늑대','초록잎사',
+  '서울별빛','부산밤하','대구빛나','인천바람','광주달빛','동쪽별','서쪽달','남쪽빛','북쪽풍','중앙의별',
+  'StarFox','MoonBow','SkyWolf','IceBlaze','FireArc','ThunderX','WindBlade','ShadowX','LightBow','DarkEdge',
+  'SwiftBow','BoldSword','SharpEye','DeepSea','HighSky','NightHawk','DawnRider','MorningDew','AutumnLeaf','SpringWind',
+  'SummerRain','WinterSnow','RisingTide','SilverArrow','GoldenSword','CrystalBow','IronShield','MysticRune','StormDancer','FireDancer',
+  'IceDancer','WindDancer','EarthDancer','LoneWolf','SwiftEagle','SilentTiger','FierceHawk','NobleLion','BraveHeart','FrostBite',
+  'ThunderBolt','FlameJet','ArcLight','VoidWalker','StarDust','MoonChild','SkyRider','CloudSurfer','StarGazer','NightOwl',
+];
+function randomBotName() { return BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)]; }
+
 // Stone placement sound (Web Audio API — no external files needed)
 function playStoneSound(isAI = false) {
   try {
@@ -416,8 +431,14 @@ const App = () => {
       setMatchmakingStatus(t('searchingOpponent'));
     }, 1000);
 
-    // No AI fallback — bots will enter the pool within 1–25s via the dispatcher
-    const timeoutId = null;
+    // After 20s with no real match, fall back to a local game with a human-looking bot name.
+    // If bots.mjs / Cloud Functions are running, they will match within 1–15s and this never fires.
+    const timeoutId = setTimeout(() => {
+      if (stopped) return;
+      stopAll();
+      deleteDoc(poolRef).catch(() => {});
+      startComputerGame();
+    }, 20000);
 
     let unsubPool = null;
     let recheckInterval = null;
@@ -615,6 +636,7 @@ const App = () => {
       status: 'active',
       humanPlayer,
       aiPlayer,
+      opponentName: randomBotName(),
       moves: [],
     });
     setWinnerModal(null);
@@ -1354,7 +1376,7 @@ const App = () => {
                <span className="text-gray-800 font-bold text-xs sm:text-sm leading-tight">
                  {game.mode === 'pvp'
                    ? (isMyTurn ? t('myTurn') : `${opponentName}${t('opponentTurnOf')}`)
-                   : (isHumanTurn ? t('myTurn') : `${AI_BOT_DISPLAY_NAME}${t('opponentTurnOf')}`)}
+                   : (isHumanTurn ? t('myTurn') : `${game.opponentName || AI_BOT_DISPLAY_NAME}${t('opponentTurnOf')}`)}
                </span>
                <div className="flex items-center gap-1 mt-0.5">
                  <div className="flex gap-1">
@@ -1386,7 +1408,7 @@ const App = () => {
                  <span>{t('me')}</span>
                  <span className="text-gray-300">vs</span>
                  <div className={`w-3 h-3 rounded-full ${humanPlayer === 2 ? 'bg-gray-800' : 'bg-white border border-gray-300'}`}></div>
-                 <span>AI</span>
+                 <span className="max-w-[80px] truncate">{game.opponentName || AI_BOT_DISPLAY_NAME}</span>
                </div>
              )}
              {game.mode === 'local' && (

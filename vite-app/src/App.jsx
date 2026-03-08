@@ -51,7 +51,7 @@ const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true })
 const appId = import.meta.env.VITE_APP_ID || 'connect6-forest-v4';
 
 const BOARD_SIZE = 19;
-const MATCH_TIMEOUT = 30000;
+const MATCH_TIMEOUT = 35000; // 35s: dispatcher bot enters within 25s, need buffer
 const TURN_TIME_LIMIT = 30; // seconds per turn
 
 const AI_BOT_UID = 'ai_bot_v1';

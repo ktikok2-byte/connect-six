@@ -51,11 +51,38 @@ const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true })
 const appId = import.meta.env.VITE_APP_ID || 'connect6-forest-v4';
 
 const BOARD_SIZE = 19;
-const MATCH_TIMEOUT = 35000; // 35s: dispatcher bot enters within 25s, need buffer
 const TURN_TIME_LIMIT = 30; // seconds per turn
 
 const AI_BOT_UID = 'ai_bot_v1';
 const AI_BOT_DISPLAY_NAME = 'Player_x7k2';
+
+// Stone placement sound (Web Audio API — no external files needed)
+function playStoneSound(isAI = false) {
+  try {
+    const AC = window.AudioContext || (window).webkitAudioContext;
+    const ctx = new AC();
+    const sampleRate = ctx.sampleRate;
+    const bufLen = Math.floor(sampleRate * 0.06); // 60ms
+    const buf = ctx.createBuffer(1, bufLen, sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufLen * 0.12));
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = buf;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = isAI ? 600 : 900;
+    filter.Q.value = 1.5;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.45;
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+    source.start();
+    source.onended = () => ctx.close().catch(() => {});
+  } catch (e) { /* unsupported browser */ }
+}
 
 const App = () => {
   const [user, setUser] = useState(null);
@@ -357,7 +384,7 @@ const App = () => {
       }).catch((err) => {
         console.error('Failed to create PvP game:', err);
         deleteDoc(poolRef).catch(() => {});
-        startComputerGame();
+        setView('lobby');
       });
       return true;
     } else {
@@ -389,12 +416,8 @@ const App = () => {
       setMatchmakingStatus(t('searchingOpponent'));
     }, 1000);
 
-    const timeoutId = setTimeout(() => {
-      if (stopped) return;
-      stopAll();
-      deleteDoc(poolRef).catch(() => {});
-      startComputerGame();
-    }, MATCH_TIMEOUT);
+    // No AI fallback — bots will enter the pool within 1–25s via the dispatcher
+    const timeoutId = null;
 
     let unsubPool = null;
     let recheckInterval = null;
@@ -471,10 +494,10 @@ const App = () => {
             setMatchmakingStatus(`${t('searchingOpponent')} (retrying...)`);
             setTimeout(() => { if (!stopped) writePool(true); }, 2000);
           } else {
-            // Second failure: fall back to AI game
+            // Second failure: return to lobby
             stopAll();
             setMatchmakingStatus(t('matchServerFailed'));
-            setTimeout(() => startComputerGame(), 1500);
+            setTimeout(() => setView('lobby'), 1500);
           }
         }
       });
@@ -1120,6 +1143,7 @@ const App = () => {
           if (checkWin(idx, turn, newBoard)) { won = true; break; }
         }
         moveCountRef.current = nextMoveCount;
+        playStoneSound(false);
         const nextTurn = won ? turn : (turn === 1 ? 2 : 1);
         const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
         await updateDoc(gameRef, {
@@ -1145,6 +1169,7 @@ const App = () => {
           if (checkWin(idx, turn, newBoard)) { won = true; break; }
         }
         moveCountRef.current = nextMoveCount;
+        playStoneSound(false);
         if (won) {
           setBoard(newBoard);
           setWinnerModal({ text: turn === 1 ? t('blackWins') : t('whiteWins'), isWinner: true });
@@ -1173,6 +1198,7 @@ const App = () => {
           if (checkWin(idx, humanPlayer, newBoard)) { won = true; break; }
         }
         moveCountRef.current = nextMoveCount;
+        playStoneSound(false);
         setBoard(newBoard);
         setAiMoves(newAiMoves);
         setMoveCount(nextMoveCount);
@@ -1274,6 +1300,7 @@ const App = () => {
       newBoard[aiIdx] = aiPlayer;
 
       setAiMoves(prev => [...prev, { idx: aiIdx, player: aiPlayer, moveNumber: moveCountRef.current + 1 }]);
+      playStoneSound(true);
 
       if (checkWin(aiIdx, aiPlayer, newBoard)) {
         setBoard(newBoard);

@@ -5,7 +5,9 @@ import {
   getAuth,
   onAuthStateChanged,
   createUserWithEmailAndPassword,
-  signInWithEmailAndPassword
+  signInWithEmailAndPassword,
+  setPersistence,
+  browserSessionPersistence
 } from 'firebase/auth';
 import {
   initializeFirestore,
@@ -25,7 +27,7 @@ import {
   runTransaction,
   arrayUnion
 } from 'firebase/firestore';
-import { Trophy, Play, Shield, LogOut, RefreshCw, Clock, UserPlus, Copy, Check, XCircle, Timer, History, Users, ChevronLeft, ChevronRight, Gamepad2, Eye } from 'lucide-react';
+import { Trophy, Play, Shield, LogOut, RefreshCw, Clock, UserPlus, XCircle, Timer, History, Users, ChevronLeft, ChevronRight, Gamepad2, Eye } from 'lucide-react';
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import { Analytics } from '@vercel/analytics/react';
 import { translations } from './translations';
@@ -60,8 +62,6 @@ const App = () => {
   const [userData, setUserData] = useState(null);
   const [view, setView] = useState('login');
   const [loginMode, setLoginMode] = useState('login');
-  const [autoCredentials, setAutoCredentials] = useState(null);
-  const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [currentGame, setCurrentGame] = useState(null);
@@ -75,6 +75,7 @@ const App = () => {
   const gameResultHandled = useRef(false);
   const pendingUsername = useRef(null);
   const currentAuthUid = useRef(null); // tracks latest auth uid to abort stale callbacks
+  const pendingIsGuest = useRef(false);
   const [lang, setLang] = useState('ko');
 
   // Friend match state
@@ -150,7 +151,11 @@ const App = () => {
         totalGames: 0,
         winRate: 0,
         lang: lang,
+        isHuman: true,
+        isBot: false,
+        ...(pendingIsGuest.current ? { isGuest: true } : {}),
       };
+      pendingIsGuest.current = false;
       await setDoc(doc(db, 'artifacts', appId, 'users', uid, 'profile', 'data'), newData);
       await setDoc(doc(db, 'artifacts', appId, 'leaderboard', uid), newData);
       setUserData(newData);
@@ -223,24 +228,24 @@ const App = () => {
     }
   };
 
-  const handleAutoRegister = async () => {
+  const handleGuestLogin = async () => {
     setIsSubmitting(true);
     setError("");
     try {
-      const generateSecureString = (length) => {
+      await setPersistence(auth, browserSessionPersistence);
+      const generateStr = (length) => {
         const array = new Uint8Array(length);
         window.crypto.getRandomValues(array);
         return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('').slice(0, length);
       };
-      const id = `player_${generateSecureString(6)}`;
-      const pw = generateSecureString(12);
-      const email = `${id}@forest6.com`;
-      await createUserWithEmailAndPassword(auth, email, pw);
-      await auth.signOut();
-      setAutoCredentials({ id, pw });
-      setLoginMode('credentials');
+      const id = `guest_${generateStr(6)}`;
+      const pw = generateStr(12);
+      pendingIsGuest.current = true;
+      await createUserWithEmailAndPassword(auth, `${id}@forest6.com`, pw);
+      // onAuthStateChanged fires automatically → goes to lobby
     } catch (err) {
-      setError(err.code === 'auth/email-already-in-use' ? t('idInUse') : t('regFailed') + err.message);
+      pendingIsGuest.current = false;
+      setError(t('regFailed') + err.message);
     } finally {
       setIsSubmitting(false);
     }
@@ -786,7 +791,7 @@ const App = () => {
     const profileRef = doc(db, 'artifacts', appId, 'users', AI_BOT_UID, 'profile', 'data');
     const leaderSnap = await getDoc(leaderRef);
     if (!leaderSnap.exists()) {
-      const botData = { uid: AI_BOT_UID, username: AI_BOT_DISPLAY_NAME, wins: 0, losses: 0, totalGames: 0, winRate: 0, isBot: true };
+      const botData = { uid: AI_BOT_UID, username: AI_BOT_DISPLAY_NAME, wins: 0, losses: 0, totalGames: 0, winRate: 0, isBot: true, isHuman: false };
       await Promise.all([setDoc(leaderRef, botData), setDoc(profileRef, botData)]);
     }
   };
@@ -815,6 +820,17 @@ const App = () => {
       setError(t('userNotFound'));
     }
   };
+
+  // Guest cleanup on browser close
+  useEffect(() => {
+    if (!user || !userData?.isGuest) return;
+    const cleanup = () => {
+      deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data')).catch(() => {});
+      deleteDoc(doc(db, 'artifacts', appId, 'leaderboard', user.uid)).catch(() => {});
+    };
+    window.addEventListener('beforeunload', cleanup);
+    return () => window.removeEventListener('beforeunload', cleanup);
+  }, [user?.uid, userData?.isGuest]);
 
   // User rank computation
   const userRank = useMemo(() => {
@@ -881,7 +897,7 @@ const App = () => {
     const turnTimerRef = useRef(null);
     const timeoutClaimRef = useRef(false);
     const [aiMoves, setAiMoves] = useState([]);
-    const [pendingMoveIdx, setPendingMoveIdx] = useState(null);
+    const [pendingMoves, setPendingMoves] = useState([]);
     const opponentUidRef = useRef('');
 
     // AI first move when AI is black
@@ -1064,121 +1080,106 @@ const App = () => {
       return false;
     };
 
-    const executePlaceStone = async (idx) => {
-      if (board[idx] !== 0 || winnerModal || gameFinished) return;
-
-      if (game.mode === 'pvp') {
-        if (!isMyTurn) return;
-
-        const newBoard = [...board];
-        newBoard[idx] = turn;
-        const won = checkWin(idx, turn, newBoard);
-
-        let nextTurn = turn;
-        let nextTurnMoves = turnMoves + 1;
-        const nextMoveCount = moveCountRef.current + 1;
-        const turnSwitching = !won && (moveCountRef.current === 0 || nextTurnMoves === 2);
-        if (turnSwitching) {
-          nextTurn = turn === 1 ? 2 : 1;
-          nextTurnMoves = 0;
-        }
-
-        const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
-        await updateDoc(gameRef, {
-          board: newBoard,
-          turn: won ? turn : nextTurn,
-          turnMoves: nextTurnMoves,
-          moveCount: nextMoveCount,
-          ...(turnSwitching || won ? { lastMoveAt: Date.now() } : {}),
-          ...(won ? {
-            status: 'finished',
-            winner: user.uid,
-            winReason: 'connect6'
-          } : {}),
-          moves: arrayUnion({ idx, player: turn, moveNumber: nextMoveCount, timestamp: Date.now() })
-        });
-        return;
-      }
-
-      // Local 2-player mode (both players on same screen)
-      if (game.mode === 'local') {
-        const newBoard = [...board];
-        newBoard[idx] = turn;
-        if (checkWin(idx, turn, newBoard)) {
-          setBoard(newBoard);
-          setWinnerModal({ text: turn === 1 ? t('blackWins') : t('whiteWins'), isWinner: true });
-          return;
-        }
-        let nextTurn = turn;
-        let nextTurnMoves = turnMoves + 1;
-        moveCountRef.current++;
-        if (moveCountRef.current === 1 || nextTurnMoves === 2) {
-          nextTurn = turn === 1 ? 2 : 1;
-          nextTurnMoves = 0;
-        }
-        setBoard(newBoard);
-        setTurn(nextTurn);
-        setTurnMoves(nextTurnMoves);
-        setMoveCount(moveCountRef.current);
-        return;
-      }
-
-      // AI mode
-      const humanPlayer = game.humanPlayer || 1;
-      const aiPlayer = game.aiPlayer || 2;
-
-      if (turn !== humanPlayer) return;
-
-      const newBoard = [...board];
-      newBoard[idx] = turn;
-
-      const newMoves = [...aiMoves, { idx, player: turn, moveNumber: moveCountRef.current + 1 }];
-      setAiMoves(newMoves);
-
-      if (checkWin(idx, turn, newBoard)) {
-        setBoard(newBoard);
-        setWinnerModal({ text: t('youWin'), isWinner: true });
-        if (!gameResultHandled.current) {
-          gameResultHandled.current = true;
-          updatePlayerStats(user.uid, AI_BOT_UID).catch(() => {});
-          fetchLeaderboard();
-        }
-        return;
-      }
-
-      let nextTurn = turn;
-      let nextTurnMoves = turnMoves + 1;
-      moveCountRef.current++;
-      if (moveCountRef.current === 1 || nextTurnMoves === 2) {
-        nextTurn = turn === 1 ? 2 : 1;
-        nextTurnMoves = 0;
-      }
-      lastMoveAtRef.current = Date.now();
-      timeoutClaimRef.current = false;
-      setBoard(newBoard);
-      setTurn(nextTurn);
-      setTurnMoves(nextTurnMoves);
-      setMoveCount(moveCountRef.current);
-      if (nextTurn === aiPlayer) {
-        const delay = Math.floor(Math.random() * 800) + 400;
-        setTimeout(() => triggerAiMove(newBoard, aiPlayer, nextTurnMoves), delay);
-      }
-    };
-
-    // Two-click stone placement: first click selects (pending), confirm button places
     const handleCellClick = (idx) => {
       if (board[idx] !== 0 || winnerModal || gameFinished) return;
       if (game.mode === 'pvp' && !isMyTurn) return;
       if (game.mode === 'ai' && turn !== (game.humanPlayer || 1)) return;
-      // Update pending position (first click or change selection)
-      setPendingMoveIdx(idx);
+      const required = moveCountRef.current === 0 ? 1 : 2;
+      setPendingMoves(prev => {
+        if (prev.includes(idx)) return prev.filter(i => i !== idx); // deselect
+        if (prev.length >= required) return [...prev.slice(-(required - 1)), idx]; // replace oldest
+        return [...prev, idx];
+      });
     };
 
     const confirmPlacement = async () => {
-      if (pendingMoveIdx === null) return;
-      const idx = pendingMoveIdx;
-      setPendingMoveIdx(null);
-      await executePlaceStone(idx);
+      if (pendingMoves.length === 0) return;
+      const moves = [...pendingMoves];
+      setPendingMoves([]);
+      await executePlaceStones(moves);
+    };
+
+    const executePlaceStones = async (indices) => {
+      if (game.mode === 'pvp') {
+        if (!isMyTurn) return;
+        const newBoard = [...board];
+        let won = false;
+        let nextMoveCount = moveCountRef.current;
+        const moveEntries = [];
+        for (const idx of indices) {
+          if (newBoard[idx] !== 0) continue;
+          newBoard[idx] = turn;
+          nextMoveCount++;
+          moveEntries.push({ idx, player: turn, moveNumber: nextMoveCount, timestamp: Date.now() });
+          if (checkWin(idx, turn, newBoard)) { won = true; break; }
+        }
+        moveCountRef.current = nextMoveCount;
+        const nextTurn = won ? turn : (turn === 1 ? 2 : 1);
+        const gameRef = doc(db, 'artifacts', appId, 'games', game.id);
+        await updateDoc(gameRef, {
+          board: newBoard,
+          turn: nextTurn,
+          turnMoves: 0,
+          moveCount: nextMoveCount,
+          lastMoveAt: Date.now(),
+          ...(won ? { status: 'finished', winner: user.uid, winReason: 'connect6' } : {}),
+          moves: arrayUnion(...moveEntries),
+        });
+        return;
+      }
+
+      if (game.mode === 'local') {
+        let newBoard = [...board];
+        let won = false;
+        let nextMoveCount = moveCountRef.current;
+        for (const idx of indices) {
+          if (newBoard[idx] !== 0) continue;
+          newBoard[idx] = turn;
+          nextMoveCount++;
+          if (checkWin(idx, turn, newBoard)) { won = true; break; }
+        }
+        moveCountRef.current = nextMoveCount;
+        if (won) {
+          setBoard(newBoard);
+          setWinnerModal({ text: turn === 1 ? t('blackWins') : t('whiteWins'), isWinner: true });
+          return;
+        }
+        const nextTurn = turn === 1 ? 2 : 1;
+        setBoard(newBoard);
+        setTurn(nextTurn);
+        setTurnMoves(0);
+        setMoveCount(nextMoveCount);
+        return;
+      }
+
+      if (game.mode === 'ai') {
+        const humanPlayer = game.humanPlayer || 1;
+        const aiPlayer = humanPlayer === 1 ? 2 : 1;
+        let newBoard = [...board];
+        let won = false;
+        let nextMoveCount = moveCountRef.current;
+        const newAiMoves = [...aiMoves];
+        for (const idx of indices) {
+          if (newBoard[idx] !== 0) continue;
+          newBoard[idx] = humanPlayer;
+          nextMoveCount++;
+          newAiMoves.push({ idx, player: humanPlayer });
+          if (checkWin(idx, humanPlayer, newBoard)) { won = true; break; }
+        }
+        moveCountRef.current = nextMoveCount;
+        setBoard(newBoard);
+        setAiMoves(newAiMoves);
+        setMoveCount(nextMoveCount);
+        if (won) {
+          setGameFinished(true);
+          setWinnerModal({ text: t('myVictory'), isWinner: true });
+          return;
+        }
+        setTurn(aiPlayer);
+        setTurnMoves(0);
+        const delay = Math.floor(Math.random() * 800) + 400;
+        setTimeout(() => triggerAiMove(newBoard, aiPlayer, 0), delay);
+      }
     };
 
     // Score a candidate cell for AI placement
@@ -1300,7 +1301,7 @@ const App = () => {
       }
     };
 
-    const BOARD_PX = 600;
+    const BOARD_PX = Math.min(600, Math.max(280, window.innerWidth - 64));
     const CELL_SIZE = BOARD_PX / (BOARD_SIZE - 1);
 
     const timerPercent = (turnTimeLeft / TURN_TIME_LIMIT) * 100;
@@ -1379,7 +1380,7 @@ const App = () => {
 
         {/* Turn timer bar for PvP and AI */}
         {(game.mode === 'pvp' || game.mode === 'ai') && !gameFinished && (
-          <div className="w-full max-w-[660px] mb-4 h-2 bg-gray-200 rounded-full overflow-hidden">
+          <div className="w-full max-w-full mb-4 h-2 bg-gray-200 rounded-full overflow-hidden">
             <div
               className={`h-full ${timerColor} rounded-full transition-all duration-200 ease-linear`}
               style={{ width: `${timerPercent}%` }}
@@ -1436,7 +1437,7 @@ const App = () => {
                           : 'bg-gradient-to-br from-white via-gray-50 to-gray-200 shadow-[2px_3px_5px_rgba(0,0,0,0.15),inset_-1px_-1px_2px_rgba(0,0,0,0.05)] border border-gray-200'
                         }
                       `}></div>
-                    ) : pendingMoveIdx === i ? (
+                    ) : pendingMoves.includes(i) ? (
                       // Pending stone preview (semi-transparent)
                       <div className={`
                         z-20 w-[90%] h-[90%] rounded-full opacity-60 ring-2 ring-emerald-400 ring-offset-1 transition-all duration-150
@@ -1458,21 +1459,39 @@ const App = () => {
           </div>
         </div>
 
-        {/* Confirm stone placement button */}
-        {pendingMoveIdx !== null && !winnerModal && !gameFinished && (
-          <div className="mt-5 flex items-center gap-3">
-            <button
-              onClick={confirmPlacement}
-              className="px-8 py-3 bg-emerald-500 hover:bg-emerald-600 text-white font-bold rounded-2xl shadow-md transition-all transform active:scale-[0.97] text-base"
-            >
-              {t('confirmStone')}
-            </button>
-            <button
-              onClick={() => setPendingMoveIdx(null)}
-              className="px-6 py-3 bg-white/80 text-gray-500 hover:text-gray-700 font-semibold rounded-2xl border border-gray-200 transition-all text-sm"
-            >
-              {t('cancelStone')}
-            </button>
+        {/* Stone placement UI */}
+        {!winnerModal && !gameFinished && isHumanTurn && (
+          <div className="mt-5 flex flex-col items-center gap-2">
+            {(() => {
+              const required = moveCountRef.current === 0 ? 1 : 2;
+              const canConfirm = pendingMoves.length === required;
+              const remaining = required - pendingMoves.length;
+              return (
+                <>
+                  {pendingMoves.length > 0 ? (
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={confirmPlacement}
+                        disabled={!canConfirm}
+                        className={`px-8 py-3 font-bold rounded-2xl shadow-md transition-all transform active:scale-[0.97] text-base ${canConfirm ? 'bg-emerald-500 hover:bg-emerald-600 text-white' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}`}
+                      >
+                        {canConfirm ? t('confirmStone') : (lang === 'ko' ? `${remaining}개 더 선택` : `Select ${remaining} more`)}
+                      </button>
+                      <button
+                        onClick={() => setPendingMoves([])}
+                        className="px-6 py-3 bg-white/80 text-gray-500 hover:text-gray-700 font-semibold rounded-2xl border border-gray-200 transition-all text-sm"
+                      >
+                        {t('cancelStone')}
+                      </button>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-400">
+                      {required === 1 ? (lang === 'ko' ? '1개 위치를 선택하세요' : 'Select 1 spot') : (lang === 'ko' ? '2개 위치를 선택하세요' : 'Select 2 spots')}
+                    </p>
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
       </div>
@@ -1501,7 +1520,7 @@ const App = () => {
       return () => unsub();
     }, [gameId]);
 
-    const BOARD_PX = 600;
+    const BOARD_PX = Math.min(600, Math.max(280, window.innerWidth - 64));
     const CELL_SIZE = BOARD_PX / (BOARD_SIZE - 1);
 
     return (
@@ -1572,7 +1591,7 @@ const App = () => {
       return replayMoveIndex > 0 && replayMoveIndex <= sortedMoves.length ? sortedMoves[replayMoveIndex - 1].idx : -1;
     }, [replayData.moves, replayMoveIndex]);
 
-    const BOARD_PX = 600;
+    const BOARD_PX = Math.min(600, Math.max(280, window.innerWidth - 64));
     const CELL_SIZE = BOARD_PX / (BOARD_SIZE - 1);
 
     return (
@@ -1704,37 +1723,7 @@ const App = () => {
             <p className="text-emerald-600 mb-10 font-medium text-sm">{t('welcome')}</p>
             {error && <p className="text-red-500 text-sm mb-4">{error}</p>}
 
-            {loginMode === 'credentials' ? (
-              <div className="space-y-6">
-                <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-6 text-left">
-                  <p className="text-emerald-700 font-semibold text-sm mb-4">{t('accountCreated')}</p>
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between bg-white rounded-xl px-4 py-3 border border-gray-100">
-                      <div>
-                        <span className="text-xs text-gray-400 block">{t('idLabel')}</span>
-                        <span className="text-gray-800 font-mono font-bold select-all">{autoCredentials?.id}</span>
-                      </div>
-                      <button onClick={() => { navigator.clipboard.writeText(autoCredentials?.id); setCopied('id'); setTimeout(() => setCopied(false), 1500); }} className="p-2 text-gray-400 hover:text-emerald-500 transition-colors">
-                        {copied === 'id' ? <Check size={16} className="text-emerald-500" /> : <Copy size={16} />}
-                      </button>
-                    </div>
-                    <div className="flex items-center justify-between bg-white rounded-xl px-4 py-3 border border-gray-100">
-                      <div>
-                        <span className="text-xs text-gray-400 block">{t('pwLabel')}</span>
-                        <span className="text-gray-800 font-mono font-bold select-all">{autoCredentials?.pw}</span>
-                      </div>
-                      <button onClick={() => { navigator.clipboard.writeText(autoCredentials?.pw); setCopied('pw'); setTimeout(() => setCopied(false), 1500); }} className="p-2 text-gray-400 hover:text-emerald-500 transition-colors">
-                        {copied === 'pw' ? <Check size={16} className="text-emerald-500" /> : <Copy size={16} />}
-                      </button>
-                    </div>
-                  </div>
-                  <p className="text-xs text-red-500 mt-4 font-medium">{t('saveWarning')}</p>
-                </div>
-                <button onClick={() => { setLoginMode('login'); setAutoCredentials(null); setCopied(false); }} className="w-full py-4 bg-emerald-500 hover:bg-emerald-600 rounded-xl font-semibold text-white transition-all shadow-md transform active:scale-[0.98] text-base">
-                  {t('goToLogin')}
-                </button>
-              </div>
-            ) : loginMode === 'login' ? (
+            {loginMode === 'login' ? (
               <>
                 <form onSubmit={handleManualLogin} className="space-y-4">
                   <input id="id" type="text" placeholder={t('loginId')} required className="w-full bg-white border border-gray-200 rounded-xl py-4 px-6 focus:ring-2 focus:ring-emerald-400 outline-none text-gray-800 transition-all placeholder:text-gray-400 shadow-sm" />
@@ -1747,8 +1736,8 @@ const App = () => {
                   <button onClick={() => { setLoginMode('register'); setError(""); }} className="text-gray-500 hover:text-emerald-600 text-sm font-medium transition-colors underline underline-offset-4 flex items-center justify-center gap-2">
                     <UserPlus size={14} /> {t('createAccount')}
                   </button>
-                  <button onClick={handleAutoRegister} disabled={isSubmitting} className="text-gray-400 hover:text-emerald-500 text-xs font-medium transition-colors underline underline-offset-4 disabled:text-gray-300">
-                    {isSubmitting ? t('creating') : t('autoRegister')}
+                  <button onClick={handleGuestLogin} disabled={isSubmitting} className="text-gray-400 hover:text-emerald-500 text-xs font-medium transition-colors underline underline-offset-4 disabled:text-gray-300">
+                    {isSubmitting ? t('creating') : t('guestMode')}
                   </button>
                 </div>
               </>
@@ -1788,6 +1777,14 @@ const App = () => {
               <button onClick={() => auth.signOut()} className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-all"><LogOut size={20} /></button>
             </div>
           </header>
+
+          {/* Guest warning banner */}
+          {userData?.isGuest && (
+            <div className="mb-4 bg-amber-50 border border-amber-200 rounded-xl p-3 flex items-center gap-2 text-sm text-amber-700">
+              <span>⚠️</span>
+              <span>{t('guestWarning')}</span>
+            </div>
+          )}
 
           {/* Pending invite banner */}
           {pendingInvite && (

@@ -22,38 +22,14 @@ async function setupPlayer(browser, label) {
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
   await page.waitForTimeout(3000);
 
-  // Auto-register
-  await page.locator('button').filter({ hasText: /빠른/ }).first().click();
-  await page.waitForTimeout(5000);
+  // Click guest mode button (previously "빠른 계정 생성", now "게스트로 시작")
+  await page.locator('button').filter({ hasText: /게스트|빠른|Guest/ }).first().click();
+  // Guest mode goes directly to lobby via onAuthStateChanged
+  await page.waitForTimeout(7000);
 
-  // Extract credentials from body text
   const bodyText = await page.textContent('body');
-  if (bodyText.includes('대결 시작')) {
-    console.log(`[${label}] Already in lobby ✅`);
-    return { page, ctx, errors, success: true };
-  }
-
-  const idMatch = bodyText.match(/player_[a-f0-9]+/);
-  const pwMatch = bodyText.match(/아이디player_[a-f0-9]+비밀번호([a-f0-9]+)/);
-  const id = idMatch ? idMatch[0] : null;
-  const pw = pwMatch ? pwMatch[1] : null;
-
-  if (!id || !pw) {
-    console.log(`[${label}] ❌ Could not extract credentials`);
-    return { page, ctx, errors, success: false };
-  }
-
-  // Go to login page and sign in
-  await page.locator('button').filter({ hasText: '로그인하러 가기' }).first().click();
-  await page.waitForTimeout(400);
-  await page.fill('#id', id);
-  await page.fill('#pw', pw);
-  await page.locator('form button').first().click();
-  await page.waitForTimeout(6000);
-
-  const after = await page.textContent('body');
-  const success = after.includes('대결 시작');
-  console.log(`[${label}] Login ${success ? '✅ in lobby' : '❌ failed'}`);
+  const success = bodyText.includes('대결 시작');
+  console.log(`[${label}] Guest login ${success ? '✅ in lobby' : '❌ failed'}`);
   return { page, ctx, errors, success };
 }
 

@@ -369,7 +369,7 @@ const App = () => {
   const startMatchmaking = () => {
     if (!user) { setView('login'); return; } // Guard: user must be logged in
     setView('matchmaking');
-    setMatchmakingStatus(`${t('searchingOpponent')} (${t('toleranceLabel')}: 0%)`);
+    setMatchmakingStatus(t('searchingOpponent'));
     setElapsedTime(0);
     const startTime = Date.now();
     let stopped = false;
@@ -386,8 +386,7 @@ const App = () => {
       if (stopped) return;
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       setElapsedTime(elapsed);
-      const tolerance = calcTolerance(elapsed);
-      setMatchmakingStatus(`${t('searchingOpponent')} (${t('toleranceLabel')}: ${tolerance}%)`);
+      setMatchmakingStatus(t('searchingOpponent'));
     }, 1000);
 
     const timeoutId = setTimeout(() => {
@@ -926,7 +925,7 @@ const App = () => {
         if (remaining <= 0 && turn === humanPlayer && !timeoutClaimRef.current) {
           timeoutClaimRef.current = true;
           setGameFinished(true);
-          setWinnerModal({ text: t('youLose') + t('timeout'), isWinner: false });
+          setWinnerModal({ text: t('youLose') + t('timeout'), isWinner: false, isAI: true });
           if (!gameResultHandled.current) {
             gameResultHandled.current = true;
             updatePlayerStats(AI_BOT_UID, user.uid).catch(() => {});
@@ -1033,7 +1032,8 @@ const App = () => {
             loserUid = data.loser;
             winnerName = data.winner === 'player1' ? data.player1.username : data.player2.username;
           } else {
-            winnerUid = data.winner;
+            // Support both string UID (current) and legacy {uid, username} object format
+            winnerUid = typeof data.winner === 'object' ? data.winner?.uid : data.winner;
             loserUid = winnerUid === data.player1.uid ? data.player2.uid : data.player1.uid;
             winnerName = winnerUid === data.player1.uid ? data.player1.username : data.player2.username;
           }
@@ -1178,7 +1178,7 @@ const App = () => {
         setMoveCount(nextMoveCount);
         if (won) {
           setGameFinished(true);
-          setWinnerModal({ text: t('myVictory'), isWinner: true });
+          setWinnerModal({ text: t('myVictory'), isWinner: true, isAI: true });
           return;
         }
         setTurn(aiPlayer);
@@ -1277,7 +1277,7 @@ const App = () => {
 
       if (checkWin(aiIdx, aiPlayer, newBoard)) {
         setBoard(newBoard);
-        setWinnerModal({ text: t('youLose'), isWinner: false });
+        setWinnerModal({ text: t('youLose'), isWinner: false, isAI: true });
         // Track AI win stats
         if (!gameResultHandled.current) {
           gameResultHandled.current = true;
@@ -2065,9 +2065,6 @@ const App = () => {
                  <Clock size={16} className="text-emerald-500" />
                  <span>{elapsedTime}{t('elapsed')}</span>
                </div>
-               <div className="inline-flex items-center gap-2 bg-emerald-50 px-4 py-3 rounded-full border border-emerald-100 text-emerald-700 font-medium shadow-sm text-sm">
-                 <span>{t('toleranceRange')}: {Math.min(Math.floor(elapsedTime / 2) * 10, 100)}%</span>
-               </div>
              </div>
 
              <div>
@@ -2237,6 +2234,7 @@ const App = () => {
         const isWin = typeof winnerModal === 'object' ? winnerModal.isWinner : true;
         const modalText = typeof winnerModal === 'object' ? winnerModal.text : winnerModal;
         const isPvP = typeof winnerModal === 'object' && winnerModal.isPvP;
+        const isAI = typeof winnerModal === 'object' && winnerModal.isAI;
         const iRequestedRematch = typeof winnerModal === 'object' && winnerModal.iRequestedRematch;
         const opponentRequestedRematch = typeof winnerModal === 'object' && winnerModal.opponentRequestedRematch;
 
@@ -2298,6 +2296,17 @@ const App = () => {
                 {isWin ? t('victoryMessage') : t('defeatMessage')}
               </p>
               <div className="space-y-3">
+                {isAI && (
+                  <button
+                    onClick={() => { setWinnerModal(null); startComputerGame(); }}
+                    className="w-full py-5 font-bold rounded-2xl transition-all shadow-md transform active:scale-[0.98] text-lg bg-blue-500 hover:bg-blue-600 text-white"
+                  >
+                    <div className="flex items-center justify-center gap-2">
+                      <RefreshCw size={20} />
+                      {t('playAgain')}
+                    </div>
+                  </button>
+                )}
                 {isPvP && (
                   <button
                     onClick={handleRematchRequest}

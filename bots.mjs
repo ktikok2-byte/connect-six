@@ -349,7 +349,9 @@ class Bot {
         if (data.status !== 'active') {
           clearTimeout(timeout); unsub();
           if (data.winner && data.loser && !data.statsRecorded) {
-            await this.recordStats(data.winner.uid, data.loser.uid, gameId);
+            const wUid = typeof data.winner === 'object' ? data.winner.uid : data.winner;
+            const lUid = typeof data.loser  === 'object' ? data.loser.uid  : data.loser;
+            await this.recordStats(wUid, lUid, gameId);
           }
           resolve('finished');
           return;
@@ -389,8 +391,8 @@ class Bot {
 
         if (won) {
           update.status   = 'finished';
-          update.winner   = { uid: this.uid, username: this.username };
-          update.loser    = oppData;
+          update.winner   = this.uid;
+          update.loser    = oppData.uid;
           update.winReason = 'connect6';
           clearTimeout(timeout); unsub();
           await updateDoc(gameRef, update).catch(() => {});
@@ -497,40 +499,41 @@ class Bot {
   async recordStats(winnerUid, loserUid, gameId) {
     try {
       const gameRef     = doc(this.db, 'artifacts', APP_ID, 'games', gameId);
-      const gSnap = await getDoc(gameRef);
-      if (gSnap.exists() && gSnap.data().statsRecorded) return;
-
       const wProfileRef = doc(this.db, 'artifacts', APP_ID, 'users', winnerUid, 'profile', 'data');
       const wLeaderRef  = doc(this.db, 'artifacts', APP_ID, 'leaderboard', winnerUid);
       const lProfileRef = doc(this.db, 'artifacts', APP_ID, 'users', loserUid, 'profile', 'data');
       const lLeaderRef  = doc(this.db, 'artifacts', APP_ID, 'leaderboard', loserUid);
 
-      const [wSnap, lSnap] = await Promise.all([getDoc(wProfileRef), getDoc(lProfileRef)]);
-      const wData = wSnap.exists() ? wSnap.data() : { wins:0, losses:0, totalGames:0 };
-      const lData = lSnap.exists() ? lSnap.data() : { wins:0, losses:0, totalGames:0 };
+      let wUpdate, lUpdate;
+      await runTransaction(this.db, async (tx) => {
+        const [gSnap, wSnap, lSnap] = await Promise.all([
+          tx.get(gameRef), tx.get(wProfileRef), tx.get(lProfileRef),
+        ]);
+        if (gSnap.exists() && gSnap.data().statsRecorded) return; // already recorded
 
-      const wWins  = (wData.wins || 0) + 1;
-      const wTotal = (wData.totalGames || 0) + 1;
-      const lLoss  = (lData.losses || 0) + 1;
-      const lTotal = (lData.totalGames || 0) + 1;
-      const wUpdate = { wins: wWins, totalGames: wTotal, winRate: Math.round(wWins/wTotal*100) };
-      const lUpdate = { losses: lLoss, totalGames: lTotal, winRate: Math.round((lData.wins||0)/lTotal*100) };
+        const wData = wSnap.exists() ? wSnap.data() : { wins:0, losses:0, totalGames:0 };
+        const lData = lSnap.exists() ? lSnap.data() : { wins:0, losses:0, totalGames:0 };
+        const wWins  = (wData.wins || 0) + 1;
+        const wTotal = (wData.totalGames || 0) + 1;
+        const lLoss  = (lData.losses || 0) + 1;
+        const lTotal = (lData.totalGames || 0) + 1;
+        wUpdate = { wins: wWins, totalGames: wTotal, winRate: Math.round(wWins/wTotal*100) };
+        lUpdate = { losses: lLoss, totalGames: lTotal, winRate: Math.round((lData.wins||0)/lTotal*100) };
 
-      await Promise.all([
-        setDoc(wProfileRef, wUpdate, { merge: true }),
-        setDoc(wLeaderRef,  wUpdate, { merge: true }),
-        setDoc(lProfileRef, lUpdate, { merge: true }),
-        setDoc(lLeaderRef,  lUpdate, { merge: true }),
-        setDoc(gameRef, { statsRecorded: true }, { merge: true }),
-      ]);
+        tx.set(wProfileRef, wUpdate, { merge: true });
+        tx.set(wLeaderRef,  wUpdate, { merge: true });
+        tx.set(lProfileRef, lUpdate, { merge: true });
+        tx.set(lLeaderRef,  lUpdate, { merge: true });
+        tx.set(gameRef, { statsRecorded: true }, { merge: true });
+      });
 
       // Update local cache
-      if (winnerUid === this.uid) {
+      if (wUpdate && winnerUid === this.uid) {
         this.winRate = wUpdate.winRate;
-        this.totalGames = wTotal;
-      } else if (loserUid === this.uid) {
+        this.totalGames = wUpdate.totalGames;
+      } else if (lUpdate && loserUid === this.uid) {
         this.winRate = lUpdate.winRate;
-        this.totalGames = lTotal;
+        this.totalGames = lUpdate.totalGames;
       }
     } catch (e) {
       this.log(`Stats update failed: ${e.message}`);
@@ -659,9 +662,6 @@ async function startDispatcher(bots) {
 
       // A bot is already in the pool (will naturally match)
       if (botsInPool.size > 0) continue;
-
-      // Any bot already dispatched will appear in pool soon
-      if (pendingDispatches.size > 0) continue;
 
       const humanWinRate = humanEntry.data().winRate || 0;
 

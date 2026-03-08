@@ -1,4 +1,13 @@
 {
+  "name": "connect-six-bots",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node bots.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "devDependencies": {
     "playwright": "^1.58.2"
   },
